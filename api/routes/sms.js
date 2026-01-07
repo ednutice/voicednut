@@ -33,7 +33,7 @@ class EnhancedSmsService extends EventEmitter {
                 throw new Error('No FROM_NUMBER configured for SMS');
             }
 
-            console.log(`ð± Sending SMS to ${to}: ${message.substring(0, 50)}...`);
+            console.log(`📱 Sending SMS to ${to}: ${message.substring(0, 50)}...`);
 
             const smsMessage = await this.twilio.messages.create({
                 body: message,
@@ -44,7 +44,7 @@ class EnhancedSmsService extends EventEmitter {
                     : undefined
             });
 
-            console.log(`â SMS sent successfully: ${smsMessage.sid}`);
+            console.log(`✅ SMS sent successfully: ${smsMessage.sid}`);
             return {
                 success: true,
                 message_sid: smsMessage.sid,
@@ -54,7 +54,7 @@ class EnhancedSmsService extends EventEmitter {
                 status: smsMessage.status
             };
         } catch (error) {
-            console.error('â SMS sending error:', error);
+            console.error('❌ SMS sending error:', error);
             throw error;
         }
     }
@@ -66,7 +66,7 @@ class EnhancedSmsService extends EventEmitter {
             delay = 1000, batchSize = 10
         } = options;
 
-        console.log(`ð± Sending bulk SMS to ${recipients.length} recipients`);
+        console.log(`📱 Sending bulk SMS to ${recipients.length} recipients`);
 
         // Process in batches to avoid rate limiting
         for (let i = 0; i < recipients.length; i += batchSize) {
@@ -99,7 +99,7 @@ class EnhancedSmsService extends EventEmitter {
         const successful = results.filter(r => r.success).length;
         const failed = results.length - successful;
 
-        console.log(`ð Bulk SMS completed: ${successful} sent, ${failed} failed`);
+        console.log(`📊 Bulk SMS completed: ${successful} sent, ${failed} failed`);
 
         return {
             total: recipients.length,
@@ -112,7 +112,7 @@ class EnhancedSmsService extends EventEmitter {
     // AI-powered SMS conversation
     async handleIncomingSMS(from, body, messageSid) {
         try {
-            console.log(`ð¨ Incoming SMS from ${from}: ${body}`);
+            console.log(`📨 Incoming SMS from ${from}: ${body}`);
 
             // Get or create conversation context
             let conversation = this.activeConversations.get(from);
@@ -164,13 +164,13 @@ class EnhancedSmsService extends EventEmitter {
             };
 
         } catch (error) {
-            console.error('â Error handling incoming SMS:', error);
+            console.error('❌ Error handling incoming SMS:', error);
 
             // Send fallback message
             try {
                 await this.sendSMS(from, "Sorry, I'm experiencing technical difficulties. Please try again later.");
             } catch (fallbackError) {
-                console.error('â Failed to send fallback message:', fallbackError);
+                console.error('❌ Failed to send fallback message:', fallbackError);
             }
 
             throw error;
@@ -203,7 +203,7 @@ class EnhancedSmsService extends EventEmitter {
             return response;
 
         } catch (error) {
-            console.error('â AI response generation error:', error);
+            console.error('❌ AI response generation error:', error);
             return "I apologize, but I'm having trouble processing your request right now. Please try again later.";
         }
     }
@@ -240,7 +240,7 @@ class EnhancedSmsService extends EventEmitter {
         }
 
         if (cleanedCount > 0) {
-            console.log(`ð§¹ Cleaned up ${cleanedCount} old SMS conversations`);
+            console.log(`🧹 Cleaned up ${cleanedCount} old SMS conversations`);
         }
 
         return cleanedCount;
@@ -262,7 +262,7 @@ class EnhancedSmsService extends EventEmitter {
         const scheduleId = `sched_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         this.messageQueue.set(scheduleId, scheduleData);
 
-        console.log(`ð SMS scheduled for ${scheduledTime}: ${scheduleId}`);
+        console.log(`🗓️ SMS scheduled for ${scheduledTime}: ${scheduleId}`);
 
         return {
             schedule_id: scheduleId,
@@ -295,9 +295,9 @@ class EnhancedSmsService extends EventEmitter {
                 scheduleData.sent_at = new Date();
                 scheduleData.message_sid = result.message_sid;
 
-                console.log(`ð± Scheduled SMS sent: ${scheduleId}`);
+                console.log(`📱 Scheduled SMS sent: ${scheduleId}`);
             } catch (error) {
-                console.error(`â Failed to send scheduled SMS ${scheduleId}:`, error);
+                console.error(`❌ Failed to send scheduled SMS ${scheduleId}:`, error);
                 scheduleData.status = 'failed';
                 scheduleData.error = error.message;
             }
@@ -314,7 +314,7 @@ class EnhancedSmsService extends EventEmitter {
             verification: "Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.",
             order_update: "Order #{order_id} update: {status}. Track your order at {tracking_url}",
             payment_reminder: "Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}",
-            promotional: "ð Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.",
+            promotional: "🎉 Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.",
             customer_service: "Thanks for contacting us! We've received your message and will respond within 24 hours. For urgent matters, call {phone}.",
             survey: "How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!"
         };

@@ -37,7 +37,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = [];
     this.availableFunctions = {};
     
-    const defaultPrompt = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'â¢\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
+    const defaultPrompt = 'You are an intelligent AI assistant capable of adapting to different business contexts and customer needs. Be professional, helpful, and responsive to customer communication styles. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.';
     const defaultFirstMessage = 'Hello! How can I assist you today?';
 
     // Use custom prompt if provided, otherwise use default
@@ -99,7 +99,7 @@ class EnhancedGptService extends EventEmitter {
     this.personalityChanges = [];
     this.lastPersonalityUpdate = null;
 
-    console.log('ð­ Enhanced GPT Service initialized with adaptive capabilities'.green);
+    console.log('🎭 Enhanced GPT Service initialized with adaptive capabilities'.green);
     if (this.isCustomConfiguration) {
       console.log(`Custom prompt preview: ${this.baseSystemPrompt.substring(0, 100)}...`.cyan);
     }
@@ -144,7 +144,7 @@ class EnhancedGptService extends EventEmitter {
     this.currentProfilePrompt = profile.prompt;
     this.systemPrompt = this.composeSystemPrompt();
     this.updateSystemPromptWithPersonality(this.personalityPrompt);
-    console.log(`ðª Call profile set: ${this.currentProfileName}`.blue);
+    console.log(`💪 Call profile set: ${this.currentProfileName}`.blue);
   }
 
   // Set dynamic functions for this conversation
@@ -152,7 +152,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = tools;
     this.availableFunctions = implementations;
     
-    console.log(`ð§ Loaded ${tools.length} dynamic functions: ${Object.keys(implementations).join(', ')}`.blue);
+    console.log(`🔧 Loaded ${tools.length} dynamic functions: ${Object.keys(implementations).join(', ')}`.blue);
   }
 
   // Add the callSid to the chat context
@@ -216,12 +216,12 @@ class EnhancedGptService extends EventEmitter {
 
     // Analyze customer message and adapt personality if needed
     if (role === 'user') {
-      console.log(`ð Analyzing message for adaptation...`.blue);
+      console.log(`🔍 Analyzing message for adaptation...`.blue);
       
       const adaptation = this.personalityEngine.adaptPersonality(text, this.conversationHistory);
       
       if (adaptation.personalityChanged) {
-        console.log(`ð­ Personality: ${adaptation.previousPersonality} â ${adaptation.currentPersonality}`.magenta);
+        console.log(`🎭 Personality: ${adaptation.previousPersonality} → ${adaptation.currentPersonality}`.magenta);
         
         // Update system prompt with new personality
         this.updateSystemPromptWithPersonality(adaptation.adaptedPrompt);
@@ -246,7 +246,7 @@ class EnhancedGptService extends EventEmitter {
         });
       }
 
-      console.log(`ð¯ Current: ${adaptation.currentPersonality} | Mood: ${adaptation.context.customerMood}`.cyan);
+      console.log(`🎯 Current: ${adaptation.currentPersonality} | Mood: ${adaptation.context.customerMood}`.cyan);
     }
 
     this.updateUserContext(name, role, text);
@@ -288,6 +288,7 @@ class EnhancedGptService extends EventEmitter {
     let functionName = '';
     let functionArgs = '';
     let finishReason = '';
+    let streamError = null;
 
     function collectToolInformation(deltas) {
       let name = deltas.tool_calls[0]?.function?.name || '';
@@ -300,77 +301,119 @@ class EnhancedGptService extends EventEmitter {
       }
     }
 
-    for await (const chunk of stream) {
-      if (!firstChunkAt) {
-        firstChunkAt = Date.now();
-        if (stallTimer) clearTimeout(stallTimer);
+    try {
+      for await (const chunk of stream) {
+        if (!firstChunkAt) {
+          firstChunkAt = Date.now();
+          if (stallTimer) clearTimeout(stallTimer);
+        }
+        let content = chunk.choices[0]?.delta?.content || '';
+        let deltas = chunk.choices[0].delta;
+        finishReason = chunk.choices[0].finish_reason;
+
+        if (deltas.tool_calls) {
+          collectToolInformation(deltas);
+        }
+
+        if (finishReason === 'tool_calls') {
+          // Use dynamic function if available
+          const functionToCall = this.availableFunctions[functionName];
+
+          if (!functionToCall) {
+          console.error(`❌ Function ${functionName} not found in dynamic implementations`.red);
+            // Continue without function call
+            completeResponse += `I apologize, but I cannot execute the ${functionName} function at this time.`;
+            continue;
+          }
+
+          const validatedArgs = this.validateFunctionArgs(functionArgs);
+
+          // Find the corresponding tool data for the "say" message
+          const toolData = this.dynamicTools.find(tool => tool.function.name === functionName);
+          const say = toolData?.function?.say || 'One moment please...';
+
+          // Emit the function call response with personality context
+          this.emit('gptreply', {
+            partialResponseIndex: null,
+            partialResponse: say,
+            personalityInfo: this.personalityEngine.getCurrentPersonality()
+          }, interactionCount);
+
+          let functionResponse;
+          try {
+            functionResponse = await functionToCall(validatedArgs);
+            console.log(`🔧 Executed dynamic function: ${functionName}`.green);
+          } catch (functionError) {
+          console.error(`❌ Error executing function ${functionName}:`, functionError);
+            functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
+          }
+
+          this.updateUserContext(functionName, 'function', functionResponse);
+
+          // Continue completion with function response
+          await this.completion(functionResponse, interactionCount, 'function', functionName);
+        } else {
+          completeResponse += content;
+          partialResponse += content;
+
+          if (content.trim().slice(-1) === '•' || finishReason === 'stop') {
+            const gptReply = { 
+              partialResponseIndex: this.partialResponseIndex,
+              partialResponse,
+              personalityInfo: this.personalityEngine.getCurrentPersonality(),
+              adaptationHistory: this.personalityChanges.slice(-3), // Last 3 changes
+              functionsAvailable: Object.keys(this.availableFunctions).length
+            };
+
+            this.emit('gptreply', gptReply, interactionCount);
+            this.partialResponseIndex++;
+            partialResponse = '';
+          }
+        }
       }
-      let content = chunk.choices[0]?.delta?.content || '';
-      let deltas = chunk.choices[0].delta;
-      finishReason = chunk.choices[0].finish_reason;
-
-      if (deltas.tool_calls) {
-        collectToolInformation(deltas);
-      }
-
-      if (finishReason === 'tool_calls') {
-        // Use dynamic function if available
-        const functionToCall = this.availableFunctions[functionName];
-        
-        if (!functionToCall) {
-          console.error(`â Function ${functionName} not found in dynamic implementations`.red);
-          // Continue without function call
-          completeResponse += `I apologize, but I cannot execute the ${functionName} function at this time.`;
-          continue;
-        }
-
-        const validatedArgs = this.validateFunctionArgs(functionArgs);
-        
-        // Find the corresponding tool data for the "say" message
-        const toolData = this.dynamicTools.find(tool => tool.function.name === functionName);
-        const say = toolData?.function?.say || 'One moment please...';
-
-        // Emit the function call response with personality context
-        this.emit('gptreply', {
-          partialResponseIndex: null,
-          partialResponse: say,
-          personalityInfo: this.personalityEngine.getCurrentPersonality()
-        }, interactionCount);
-
-        let functionResponse;
-        try {
-          functionResponse = await functionToCall(validatedArgs);
-          console.log(`ð§ Executed dynamic function: ${functionName}`.green);
-        } catch (functionError) {
-          console.error(`â Error executing function ${functionName}:`, functionError);
-          functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
-        }
-
-        this.updateUserContext(functionName, 'function', functionResponse);
-        
-        // Continue completion with function response
-        await this.completion(functionResponse, interactionCount, 'function', functionName);
-      } else {
-        completeResponse += content;
-        partialResponse += content;
-        
-        if (content.trim().slice(-1) === 'â¢' || finishReason === 'stop') {
-          const gptReply = { 
-            partialResponseIndex: this.partialResponseIndex,
-            partialResponse,
-            personalityInfo: this.personalityEngine.getCurrentPersonality(),
-            adaptationHistory: this.personalityChanges.slice(-3), // Last 3 changes
-            functionsAvailable: Object.keys(this.availableFunctions).length
-          };
-
-          this.emit('gptreply', gptReply, interactionCount);
-          this.partialResponseIndex++;
-          partialResponse = '';
-        }
+    } catch (err) {
+      streamError = err;
+    } finally {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
       }
     }
 
-    if (stallTimer) clearTimeout(stallTimer);
+    if (streamError) {
+      console.error('GPT stream error:', streamError);
+      this.emit('gpterror', streamError);
+
+      const fallbackResponse = 'I am having trouble replying right now • please give me a moment or try again.';
+      const fallbackReply = {
+        partialResponseIndex: this.partialResponseIndex,
+        partialResponse: fallbackResponse,
+        personalityInfo: this.personalityEngine.getCurrentPersonality(),
+        adaptationHistory: this.personalityChanges.slice(-3),
+        functionsAvailable: Object.keys(this.availableFunctions).length
+      };
+
+      this.emit('gptreply', fallbackReply, interactionCount);
+      this.partialResponseIndex++;
+
+      this.conversationHistory.push({
+        role: 'assistant',
+        content: fallbackResponse,
+        timestamp: new Date().toISOString(),
+        interactionCount: interactionCount,
+        personality: this.personalityEngine.currentPersonality,
+        functionsUsed: []
+      });
+
+      this.userContext.push({ role: 'assistant', content: fallbackResponse });
+      this.addToPhaseWindow({ role: 'assistant', content: fallbackResponse });
+
+      const finishedAt = Date.now();
+      const ttfb = firstChunkAt ? (firstChunkAt - startedAt) : null;
+      const rtt = finishedAt - startedAt;
+      this.recordLatency(ttfb, rtt);
+      return;
+    }
 
     // Store AI response in conversation history
     this.conversationHistory.push({
@@ -385,7 +428,7 @@ class EnhancedGptService extends EventEmitter {
     this.userContext.push({'role': 'assistant', 'content': completeResponse});
     this.addToPhaseWindow({ role: 'assistant', content: completeResponse });
     
-    console.log(`ð§  Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
+    console.log(`🧠 Context: ${this.userContext.length} | Personality: ${this.personalityEngine.currentPersonality} | Functions: ${Object.keys(this.availableFunctions).length}`.green);
 
     // Record latency metrics
     const finishedAt = Date.now();
@@ -404,7 +447,7 @@ class EnhancedGptService extends EventEmitter {
     
     if (systemMessageIndex !== -1) {
       this.userContext[systemMessageIndex].content = this.systemPrompt;
-      console.log(`ð System prompt updated for new personality`.green);
+      console.log(`📝 System prompt updated for new personality`.green);
     } else {
       // If no system message found, add one at the beginning
       this.userContext.unshift({ 'role': 'system', 'content': this.systemPrompt });
@@ -505,7 +548,7 @@ class EnhancedGptService extends EventEmitter {
         manual: true
       });
 
-      console.log(`ð­ Manually switched personality: ${oldPersonality} â ${personalityName}`.yellow);
+      console.log(`🎭 Manually switched personality: ${oldPersonality} → ${personalityName}`.yellow);
       
       return {
         success: true,
@@ -514,7 +557,7 @@ class EnhancedGptService extends EventEmitter {
         adaptedPrompt: adaptedPrompt
       };
     } else {
-      console.log(`â Unknown personality: ${personalityName}`.red);
+      console.log(`❌ Unknown personality: ${personalityName}`.red);
       return { success: false, error: 'Unknown personality' };
     }
   }
@@ -524,7 +567,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools.push(toolDefinition);
     this.availableFunctions[toolDefinition.function.name] = implementation;
     
-    console.log(`ð§ Added dynamic function: ${toolDefinition.function.name}`.green);
+    console.log(`🔧 Added dynamic function: ${toolDefinition.function.name}`.green);
   }
 
   // Remove dynamic function
@@ -532,7 +575,7 @@ class EnhancedGptService extends EventEmitter {
     this.dynamicTools = this.dynamicTools.filter(tool => tool.function.name !== functionName);
     delete this.availableFunctions[functionName];
     
-    console.log(`ð§ Removed dynamic function: ${functionName}`.yellow);
+    console.log(`🔧 Removed dynamic function: ${functionName}`.yellow);
   }
 
   // Get function usage statistics
@@ -575,7 +618,7 @@ class EnhancedGptService extends EventEmitter {
       this.userContext.push({ 'role': 'system', 'content': `callSid: ${this.callSid}` });
     }
 
-    console.log('ð Enhanced GPT Service reset for new conversation'.blue);
+    console.log('🔄 Enhanced GPT Service reset for new conversation'.blue);
   }
 
   // Get current configuration with comprehensive info
@@ -605,10 +648,10 @@ class EnhancedGptService extends EventEmitter {
 
     try {
       const result = await this.availableFunctions[functionName](args);
-      console.log(`ð§ª Test result for ${functionName}:`, result);
+      console.log(`🧪 Test result for ${functionName}:`, result);
       return { success: true, result: result };
     } catch (error) {
-      console.error(`â Test failed for ${functionName}:`, error);
+      console.error(`❌ Test failed for ${functionName}:`, error);
       return { success: false, error: error.message };
     }
   }

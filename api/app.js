@@ -731,7 +731,7 @@ app.ws('/connection', (ws) => {
 
           // Listen for personality changes
           gptService.on('personalityChanged', async (changeData) => {
-            console.log(`Personality adapted: ${changeData.from} â ${changeData.to}`);
+            console.log(`Personality adapted: ${changeData.from} → ${changeData.to}`);
             console.log(`Reason: ${JSON.stringify(changeData.reason)}`.blue);
             
             // Log personality change to database
@@ -2035,7 +2035,7 @@ app.post('/webhook/call-status', async (req, res) => {
       }
     }
 
-    console.log(`Final determination: ${CallStatus} â ${actualStatus} â ${notificationType}`);
+    console.log(`Final determination: ${CallStatus} → ${actualStatus} → ${notificationType}`);
 
     // Update call status in database with enhanced data
     const updateData = {
@@ -2800,15 +2800,15 @@ app.get('/api/calls/list', async (req, res) => {
 // Helper function for status icons
 function getStatusIcon(status) {
   const icons = {
-    'completed': 'â',
-    'no-answer': 'ðµ',
-    'busy': 'ð',
-    'failed': 'â',
-    'canceled': 'ð«',
-    'in-progress': 'ð',
-    'ringing': 'ð²'
+    'completed': '✅',
+    'no-answer': '📶',
+    'busy': '📞',
+    'failed': '❌',
+    'canceled': '🎫',
+    'in-progress': '🔄',
+    'ringing': '📲'
   };
-  return icons[status] || 'â';
+  return icons[status] || '❓';
 }
 
 // Add calls analytics endpoint
@@ -3100,7 +3100,7 @@ app.post('/api/sms/send', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('â SMS send error:', error);
+        console.error('❌ SMS send error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to send SMS',
@@ -3154,7 +3154,7 @@ app.post('/api/sms/bulk', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('â Bulk SMS error:', error);
+        console.error('❌ Bulk SMS error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to send bulk SMS',
@@ -3190,7 +3190,7 @@ app.post('/api/sms/schedule', async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('â SMS schedule error:', error);
+        console.error('❌ SMS schedule error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to schedule SMS',
@@ -3232,7 +3232,7 @@ app.get('/api/sms/templates', async (req, res) => {
             });
         }
     } catch (error) {
-        console.error('â SMS templates error:', error);
+        console.error('❌ SMS templates error:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to get templates'
@@ -3263,7 +3263,7 @@ app.get('/api/sms/messages/conversation/:phone', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching SMS conversation from database:', error);
+        console.error('❌ Error fetching SMS conversation from database:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch conversation',
@@ -3289,7 +3289,7 @@ app.get('/api/sms/messages/recent', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching recent SMS messages:', error);
+        console.error('❌ Error fetching recent SMS messages:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch recent messages',
@@ -3396,7 +3396,7 @@ app.get('/api/sms/database-stats', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching SMS database statistics:', error);
+        console.error('❌ Error fetching SMS database statistics:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch database statistics',
@@ -3437,7 +3437,7 @@ app.get('/api/sms/status/:messageSid', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching SMS status:', error);
+        console.error('❌ Error fetching SMS status:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch message status',
@@ -3459,7 +3459,7 @@ app.get('/api/sms/templates/:templateName?', async (req, res) => {
             verification: 'Your verification code is: {code}. This code will expire in 10 minutes. Do not share this code with anyone.',
             order_update: 'Order #{order_id} update: {status}. Track your order at {tracking_url}',
             payment_reminder: 'Payment reminder: Your payment of {amount} is due on {due_date}. Pay now: {payment_url}',
-            promotional: 'ð Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.',
+            promotional: '🎉 Special offer just for you! {offer_text} Use code {promo_code}. Valid until {expiry_date}. Reply STOP to opt out.',
             customer_service: 'Thanks for contacting us! We\'ve received your message and will respond within 24 hours. For urgent matters, call {phone}.',
             survey: 'How was your experience with us? Rate us 1-5 stars by replying with a number. Your feedback helps us improve!'
         };
@@ -3509,7 +3509,7 @@ app.get('/api/sms/templates/:templateName?', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('â Error handling SMS templates:', error);
+        console.error('❌ Error handling SMS templates:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to process template request',
@@ -3523,7 +3523,7 @@ app.post('/webhook/sms-delivery', async (req, res) => {
     try {
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage, To, From } = req.body;
 
-        console.log(`ð± SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
+        console.log(`📱 SMS Delivery Status: ${MessageSid} -> ${MessageStatus}`);
 
         // Update message status in database
         if (db) {
@@ -3558,13 +3558,13 @@ app.post('/webhook/sms-delivery', async (req, res) => {
                     MessageStatus === 'failed' ? 'high' : 'normal'
                 );
 
-                console.log(`ð¨ Created ${notificationType} notification for user ${message.user_chat_id}`);
+                console.log(`📨 Created ${notificationType} notification for user ${message.user_chat_id}`);
             }
         }
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('â SMS delivery webhook error:', error);
+        console.error('❌ SMS delivery webhook error:', error);
         res.status(200).send('OK'); // Always return 200 to prevent retries
     }
 });
@@ -3583,7 +3583,7 @@ app.get('/api/sms/stats', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('â SMS stats error:', error);
+    console.error('❌ SMS stats error:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to get SMS statistics'
@@ -3638,7 +3638,7 @@ app.get('/api/sms/bulk/status', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching bulk SMS status:', error);
+        console.error('❌ Error fetching bulk SMS status:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch bulk SMS status',
@@ -3768,7 +3768,7 @@ app.get('/api/sms/analytics', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error fetching SMS analytics:', error);
+        console.error('❌ Error fetching SMS analytics:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to fetch SMS analytics',
@@ -3856,7 +3856,7 @@ app.get('/api/sms/search', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error in SMS search:', error);
+        console.error('❌ Error in SMS search:', error);
         res.status(500).json({
             success: false,
             error: 'Search failed',
@@ -3946,7 +3946,7 @@ app.get('/api/sms/export', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('â Error exporting SMS data:', error);
+        console.error('❌ Error exporting SMS data:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to export SMS data',
@@ -4041,7 +4041,7 @@ app.get('/api/sms/health', async (req, res) => {
         res.json(health);
 
     } catch (error) {
-        console.error('â SMS health check error:', error);
+        console.error('❌ SMS health check error:', error);
         res.status(500).json({
             timestamp: new Date().toISOString(),
             status: 'unhealthy',
@@ -4072,7 +4072,7 @@ app.post('/api/sms/cleanup-conversations', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('â Error cleaning up SMS conversations:', error);
+        console.error('❌ Error cleaning up SMS conversations:', error);
         res.status(500).json({
             success: false,
             error: 'Failed to cleanup conversations',
@@ -4084,7 +4084,7 @@ app.post('/api/sms/cleanup-conversations', async (req, res) => {
 // Start scheduled message processor
 setInterval(() => {
     smsService.processScheduledMessages().catch(error => {
-        console.error('â Scheduled SMS processing error:', error);
+        console.error('❌ Scheduled SMS processing error:', error);
     });
 }, 60000); // Check every minute
 
@@ -4097,7 +4097,7 @@ startServer();
 
 // Enhanced graceful shutdown with comprehensive cleanup
 process.on('SIGINT', async () => {
-  console.log('\nð Shutting down enhanced adaptive system gracefully...');
+  console.log('\n🛑 Shutting down enhanced adaptive system gracefully...');
   
   try {
     // Log shutdown start
@@ -4117,16 +4117,16 @@ process.on('SIGINT', async () => {
     });
     
     await db.close();
-    console.log('â Enhanced adaptive system shutdown complete');
+    console.log('✅ Enhanced adaptive system shutdown complete');
   } catch (shutdownError) {
-    console.error('â Error during shutdown:', shutdownError);
+    console.error('❌ Error during shutdown:', shutdownError);
   }
   
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\nð Shutting down enhanced adaptive system gracefully...');
+  console.log('\nShutting down enhanced adaptive system gracefully...');
   
   try {
     // Log shutdown start
@@ -4147,9 +4147,9 @@ process.on('SIGTERM', async () => {
     });
     
     await db.close();
-    console.log('â Enhanced adaptive system shutdown complete');
+    console.log('Enhanced adaptive system shutdown complete');
   } catch (shutdownError) {
-    console.error('â Error during shutdown:', shutdownError);
+    console.error('Error during shutdown:', shutdownError);
   }
   
   process.exit(0);
