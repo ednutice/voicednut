@@ -151,7 +151,7 @@ const digitCollectionManager = {
   }
 };
 
-async function handleCollectionResult(callSid, collection, gptService = null) {
+async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0) {
   if (!collection) return;
   const payload = {
     profile: collection.profile,
@@ -175,6 +175,7 @@ async function handleCollectionResult(callSid, collection, gptService = null) {
   }
 
   if (collection.accepted) {
+    digitCollectionManager.expectations.delete(callSid);
     switch (collection.profile) {
       case 'menu':
       case 'extension':
@@ -221,18 +222,25 @@ async function handleCollectionResult(callSid, collection, gptService = null) {
     webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
     if (collection.fallback) {
       webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
+      digitCollectionManager.expectations.delete(callSid);
     }
   }
 
   if (gptService) {
     const note = collection.accepted
       ? collection.route
-        ? `Digit collection: menu route ${collection.route}`
-        : `Digit collection accepted (${collection.profile || 'generic'})`
+        ? `Digits accepted; menu route ${collection.route}. Acknowledge and proceed without repeating digits.`
+        : `Digits verified (${collection.profile || 'generic'}). Briefly acknowledge and continue without repeating digits.`
       : collection.fallback
-        ? `Digit collection failed after ${collection.retries} retries`
-        : `Digit collection invalid (${collection.reason || 'unknown'})`;
-    gptService.updateUserContext('digit_collection', 'system', note);
+        ? `Digit collection failed after ${collection.retries} retries. Offer a final alternative (agent transfer) without repeating digits.`
+        : `Invalid digits (${collection.reason || 'unknown'}). Politely ask for re-entry without repeating digits.`;
+
+    // Prompt GPT to respond in-call
+    try {
+      await gptService.completion(note, interactionCount, 'system', 'digit_collection');
+    } catch (err) {
+      console.error('GPT completion error during digit handling:', err);
+    }
   }
 }
 
@@ -411,6 +419,12 @@ function sanitizeOtpText(text = '', callSid = null) {
   const otpDetected = codes.length > 0;
   const sanitized = maskForGpt ? text.replace(otpRegex, '******') : text;
   return { sanitized, otpDetected, codes };
+}
+
+function shouldCloseConversation(text = '') {
+  const lower = String(text || '').toLowerCase();
+  if (!lower) return false;
+  return !!lower.match(/\b(thanks|thank you|bye|goodbye|appreciate|that.s all|that is all|have a good|bye bye)\b/);
 }
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
@@ -668,6 +682,7 @@ app.ws('/connection', (ws) => {
     let functionSystem = null;
 
     let gptService;
+    let gptErrorCount = 0;
     const streamService = new StreamService(ws);
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
@@ -729,6 +744,8 @@ app.ws('/connection', (ws) => {
           gptService.setCustomerName(callConfig?.customer_name);
           gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
 
+          let gptErrorCount = 0;
+
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
             const personalityInfo = gptReply.personalityInfo || {};
@@ -765,6 +782,31 @@ app.ws('/connection', (ws) => {
               ttsService.generate({ partialResponse: fillerText, personalityInfo: { name: 'filler' }, adaptationHistory: [] }, interactionCount);
             } catch (err) {
               console.error('Filler TTS error:', err);
+            }
+          });
+
+          gptService.on('gpterror', async (err) => {
+            gptErrorCount += 1;
+            const message = err?.message || 'GPT error';
+            webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
+            if (gptErrorCount >= 2) {
+              const fallback = { partialResponseIndex: null, partialResponse: 'I am having trouble right now • I will reconnect you or end the call. Thank you.' };
+              try {
+                await db.addTranscript({
+                  call_sid: callSid,
+                  speaker: 'ai',
+                  message: fallback.partialResponse,
+                  interaction_count: interactionCount,
+                  personality_used: 'fallback'
+                });
+              } catch (dbError) {
+                console.error('Database error adding fallback transcript:', dbError);
+              }
+              try {
+                await ttsService.generate(fallback, interactionCount);
+              } catch (ttsErr) {
+                console.error('Fallback TTS error:', ttsErr);
+              }
             }
           });
 
@@ -873,7 +915,7 @@ app.ws('/connection', (ws) => {
           if (digits) {
             webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
             const collection = digitCollectionManager.recordDigits(callSid, digits);
-            await handleCollectionResult(callSid, collection, gptService);
+            await handleCollectionResult(callSid, collection, gptService, interactionCount);
             if (collection.accepted && collection.route) {
               webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
               await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
@@ -945,7 +987,12 @@ app.ws('/connection', (ws) => {
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService);
+        await handleCollectionResult(callSid, collection, gptService, interactionCount);
+      }
+
+      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+        gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
+        gptService.setPhase('closing');
       }
       
       // Process with adaptive personality and functions
@@ -1054,9 +1101,18 @@ app.ws('/vonage/stream', (ws, req) => {
       }
     });
 
-    gptService.on('gpterror', (err) => {
+    gptService.on('gpterror', async (err) => {
+      gptErrorCount += 1;
       const message = err?.message || 'GPT error';
       webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
+      if (gptErrorCount >= 2) {
+        const fallback = { partialResponseIndex: null, partialResponse: 'I am having trouble right now • I will reconnect you or end the call. Thank you.' };
+        try {
+          await ttsService.generate(fallback, interactionCount);
+        } catch (ttsErr) {
+          console.error('Fallback TTS error:', ttsErr);
+        }
+      }
     });
 
     ttsService.on('speech', (responseIndex, audio) => {
@@ -1100,7 +1156,11 @@ app.ws('/vonage/stream', (ws, req) => {
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService);
+        await handleCollectionResult(callSid, collection, gptService, interactionCount);
+      }
+      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+        gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
+        gptService.setPhase('closing');
       }
       try {
         await gptService.completion(sanitized, interactionCount);
@@ -1219,7 +1279,12 @@ app.ws('/aws/stream', (ws, req) => {
           webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
         }
-        await handleCollectionResult(callSid, collection, session.gptService);
+        await handleCollectionResult(callSid, collection, session.gptService, interactionCount);
+      }
+
+      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+        session.gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
+        session.gptService.setPhase('closing');
       }
 
       try {
@@ -1268,6 +1333,7 @@ async function handleCallEnd(callSid, callStartTime) {
   try {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
+    digitCollectionManager.expectations.delete(callSid);
 
     const transcripts = await db.getCallTranscripts(callSid);
     const summary = generateCallSummary(transcripts, duration);
