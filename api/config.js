@@ -134,6 +134,7 @@ module.exports = {
   openRouter: {
     apiKey: ensure('OPENROUTER_API_KEY'),
     model: ensure('OPENROUTER_MODEL', 'meta-llama/llama-3.1-8b-instruct:free'),
+    backupModel: readEnv('OPENROUTER_BACKUP_MODEL'),
     siteUrl: ensure('YOUR_SITE_URL', 'http://localhost:3000'),
     siteName: ensure('YOUR_SITE_NAME', 'Voice Call Bot'),
     maxTokens: Number(ensure('OPENROUTER_MAX_TOKENS', '160'))

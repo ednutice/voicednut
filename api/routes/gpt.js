@@ -23,8 +23,9 @@ class EnhancedGptService extends EventEmitter {
     });
     
     this.model = config.openRouter.model;
+    this.backupModel = config.openRouter.backupModel || null;
     this.maxTokens = config.openRouter.maxTokens || 160;
-    this.fillerText = 'One moment while I pull that up.';
+    this.fillerText = 'One moment, checking now.';
     this.stallTimeoutMs = 2000;
     this.latencyHistory = [];
     this.maxLatencySamples = 8;
@@ -161,6 +162,12 @@ class EnhancedGptService extends EventEmitter {
     this.metadataMessages.push({ role: 'system', content: `callSid: ${callSid}` });
   }
 
+  setCallIntent(intentLine = '') {
+    const line = String(intentLine || '').trim();
+    if (!line) return;
+    this.metadataMessages.push({ role: 'system', content: line });
+  }
+
   setCustomerName(customerName) {
     if (!customerName) return;
     this.metadataMessages.push({ role: 'system', content: `customerName: ${customerName}` });
@@ -258,6 +265,7 @@ class EnhancedGptService extends EventEmitter {
 
     // Send completion request with current personality-adapted context and dynamic tools
     let stream;
+    let currentModel = this.model;
     const startedAt = Date.now();
     let firstChunkAt = null;
     let stallTimer = null;
@@ -310,18 +318,27 @@ class EnhancedGptService extends EventEmitter {
           }
         }, this.stallTimeoutMs);
 
+        const effectiveMaxTokens = interactionCount > 0
+          ? Math.min(adaptiveMaxTokens, Math.floor(this.maxTokens * 0.6))
+          : adaptiveMaxTokens;
+
         stream = await this.openai.chat.completions.create({
-          model: this.model,
+          model: currentModel,
           messages,
           tools: toolsToUse,
-          max_tokens: adaptiveMaxTokens,
+          max_tokens: effectiveMaxTokens,
           stream: true,
         });
         break; // success
       } catch (err) {
-        if (attempt >= maxAttempts) {
+        const retriable = (err?.status && err.status >= 500) || err?.code === 502;
+        const canFallback = this.backupModel && currentModel === this.model;
+        if (attempt >= maxAttempts && !canFallback) {
           handleFailure(err);
           return;
+        }
+        if (canFallback && retriable) {
+          currentModel = this.backupModel;
         }
         if (stallTimer) {
           clearTimeout(stallTimer);
@@ -453,6 +470,7 @@ class EnhancedGptService extends EventEmitter {
     const ttfb = firstChunkAt ? (firstChunkAt - startedAt) : null;
     const rtt = finishedAt - startedAt;
     this.recordLatency(ttfb, rtt);
+    console.log(`Latency | model: ${currentModel} | ttfb: ${ttfb}ms | rtt: ${rtt}ms`);
   }
 
   // Update system prompt with new personality

@@ -21,8 +21,9 @@ class TextToSpeechService extends EventEmitter {
     console.log(`🎵 TTS Service initialized with voice model: ${config.deepgram.voiceModel || 'default'}`);
   }
 
-  async generate(gptReply, interactionCount) {
-    const { partialResponseIndex, partialResponse } = gptReply;
+  async generate(gptReply, interactionCount, options = {}) {
+    const { partialResponseIndex, partialResponse } = gptReply || {};
+    const silent = !!options.silent;
 
     if (!partialResponse) { 
       console.warn('⚠️ TTS: No partialResponse provided');
@@ -58,8 +59,9 @@ class TextToSpeechService extends EventEmitter {
           const base64String = Buffer.from(audioArrayBuffer).toString('base64');
           
           console.log(`✅ TTS audio generated, size: ${base64String.length} chars`.green);
-          
-          this.emit('speech', partialResponseIndex, base64String, partialResponse, interactionCount);
+          if (!silent) {
+            this.emit('speech', partialResponseIndex, base64String, partialResponse, interactionCount);
+          }
         } catch (processingError) {
           console.error('❌ Error processing TTS audio response:', processingError);
           throw processingError;

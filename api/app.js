@@ -153,6 +153,9 @@ const digitCollectionManager = {
 
 async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0) {
   if (!collection) return;
+  const expectation = digitCollectionManager.expectations.get(callSid);
+  const expectedText = expectation ? `${expectation.min_digits || ''}${expectation.max_digits ? `-${expectation.max_digits}` : ''}`.replace(/-$/, '') : '';
+  const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
   const payload = {
     profile: collection.profile,
     raw_digits: collection.digits,
@@ -173,6 +176,21 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
   } catch (err) {
     console.error('Error logging digits_collected:', err);
   }
+
+  const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
+  const emitReply = (text) => {
+    if (!gptService || !text) return;
+    const reply = {
+      partialResponseIndex: null,
+      partialResponse: text,
+      personalityInfo,
+      adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+    };
+    gptService.emit('gptreply', reply, interactionCount);
+    try {
+      gptService.updateUserContext('system', 'system', `Digit handling note: ${text}`);
+    } catch (_) {}
+  };
 
   if (collection.accepted) {
     digitCollectionManager.expectations.delete(callSid);
@@ -218,28 +236,22 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       default:
         webhookService.addLiveEvent(callSid, `🔢 Digits captured (${collection.len})`, { force: true });
     }
+    emitReply('Thanks, I received your code. One moment while I continue.');
   } else {
     webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
     if (collection.fallback) {
       webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
       digitCollectionManager.expectations.delete(callSid);
-    }
-  }
-
-  if (gptService) {
-    const note = collection.accepted
-      ? collection.route
-        ? `Digits accepted; menu route ${collection.route}. Acknowledge and proceed without repeating digits.`
-        : `Digits verified (${collection.profile || 'generic'}). Briefly acknowledge and continue without repeating digits.`
-      : collection.fallback
-        ? `Digit collection failed after ${collection.retries} retries. Offer a final alternative (agent transfer) without repeating digits.`
-        : `Invalid digits (${collection.reason || 'unknown'}). Politely ask for re-entry without repeating digits.`;
-
-    // Prompt GPT to respond in-call
-    try {
-      await gptService.completion(note, interactionCount, 'system', 'digit_collection');
-    } catch (err) {
-      console.error('GPT completion error during digit handling:', err);
+      emitReply('I could not verify the code. I will connect you to a specialist now.');
+      await db.updateCallState(callSid, 'route_requested', { reason: 'digit_collection_failed', via: 'auto' }).catch(() => {});
+    } else {
+      const prompts = [
+        `That did not go through. Please re-enter the ${expectedLabel} using your keypad.`,
+        `I could not read that. Enter the ${expectedLabel} again on your keypad, please.`,
+        `Let’s try once more—type the ${expectedLabel} on your keypad now.`
+      ];
+      const prompt = prompts[Math.floor(Math.random() * prompts.length)];
+      emitReply(prompt);
     }
   }
 }
@@ -365,6 +377,14 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
         digitCollectionManager.setExpectation(callSid, payload);
         if (gptService) {
+          const instruction = `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
+          const reply = {
+            partialResponseIndex: null,
+            partialResponse: instruction,
+            personalityInfo: gptService.personalityEngine.getCurrentPersonality(),
+            adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+          };
+          gptService.emit('gptreply', reply, 0);
           gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits. Prompt: ${payload.prompt}`);
         }
       } catch (err) {
@@ -559,6 +579,8 @@ async function ensureAwsSession(callSid) {
   gptService.setCallSid(callSid);
   gptService.setCustomerName(callConfig?.customer_name);
   gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
+  const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+  gptService.setCallIntent(intentLine);
 
   const session = {
     startTime: new Date(),
@@ -686,6 +708,8 @@ app.ws('/connection', (ws) => {
     const streamService = new StreamService(ws);
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
+    // Prewarm TTS to reduce first-synthesis delay (silent)
+    ttsService.generate({ partialResponseIndex: null, partialResponse: 'warming up' }, -1, { silent: true }).catch(() => {});
   
     let marks = [];
     let interactionCount = 0;
@@ -743,6 +767,8 @@ app.ws('/connection', (ws) => {
           gptService.setCallSid(callSid);
           gptService.setCustomerName(callConfig?.customer_name);
           gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
+          const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+          gptService.setCallIntent(intentLine);
 
           let gptErrorCount = 0;
 
@@ -1041,6 +1067,7 @@ app.ws('/vonage/stream', (ws, req) => {
     }
 
     const ttsService = new TextToSpeechService();
+    ttsService.generate({ partialResponseIndex: null, partialResponse: 'warming up' }, -1, { silent: true }).catch(() => {});
     const transcriptionService = new TranscriptionService({
       encoding: 'mulaw',
       sampleRate: 8000
@@ -1058,6 +1085,8 @@ app.ws('/vonage/stream', (ws, req) => {
     gptService.setCallSid(callSid);
     gptService.setCustomerName(callConfig?.customer_name);
     gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
+    const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
+    gptService.setCallIntent(intentLine);
 
     activeCalls.set(callSid, {
       startTime: new Date(),
