@@ -19,6 +19,7 @@ yarn-error.log*
 **/dist
 **/build
 
+#
 # Local databases or data files
 api/db/data.db
 bot/db/data.db
