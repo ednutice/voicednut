@@ -207,6 +207,9 @@ class EnhancedGptService extends EventEmitter {
 
   // Enhanced completion method with dynamic functions and personality adaptation
   async completion(text, interactionCount, role = 'user', name = 'user') {
+    if (!text || String(text).trim().length === 0) {
+      return;
+    }
     if (!this.openai?.chat?.completions) {
       throw new Error('OpenRouter client not initialized');
     }

@@ -254,6 +254,16 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       emitReply(prompt);
     }
   }
+
+  // Live console summary note for ops visibility
+  const summary = collection.accepted
+    ? collection.route
+      ? `✅ Digits accepted • routed: ${collection.route}`
+      : `✅ Digits accepted (${collection.len})`
+    : collection.fallback
+      ? `⚠️ Digits failed after retries`
+      : `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`;
+  webhookService.addLiveEvent(callSid, summary, { force: true });
 }
 
 // Built-in telephony function templates to give GPT deterministic controls
@@ -1016,6 +1026,11 @@ app.ws('/connection', (ws) => {
         await handleCollectionResult(callSid, collection, gptService, interactionCount);
       }
 
+      if (!sanitized || !sanitized.trim()) {
+        interactionCount += 1;
+        return;
+      }
+
       if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
         gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
         gptService.setPhase('closing');
@@ -1186,6 +1201,10 @@ app.ws('/vonage/stream', (ws, req) => {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
         await handleCollectionResult(callSid, collection, gptService, interactionCount);
+      }
+      if (!sanitized || !sanitized.trim()) {
+        interactionCount += 1;
+        return;
       }
       if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
         gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
