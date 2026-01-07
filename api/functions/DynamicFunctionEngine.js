@@ -124,7 +124,7 @@ class DynamicFunctionEngine {
     const analysis = this.analyzeBusinessContext(prompt, firstMessage);
     this.businessContext = analysis;
     
-    console.log(`🔍 Detected business context: ${analysis.industry} - ${analysis.businessType}`.cyan);
+    console.log(`Detected business context: ${analysis.industry} - ${analysis.businessType}`.cyan);
     console.log(`📋 Suggested functions: ${analysis.suggestedFunctions.join(', ')}`.blue);
 
     const functions = [];

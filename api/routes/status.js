@@ -711,7 +711,7 @@ class EnhancedWebhookService {
   // Debug method for troubleshooting
   async sendDebugInfo(call_sid, telegram_chat_id, webhookData) {
     try {
-      const debugMessage = `🔍 *Debug Info* for Call ${call_sid.slice(-6)}:
+      const debugMessage = `*Debug Info* for Call ${call_sid.slice(-6)}:
       
 📊 *Status:* ${webhookData.CallStatus}
 ⏱️ *Duration:* ${webhookData.Duration || 'N/A'}
@@ -865,10 +865,12 @@ class EnhancedWebhookService {
     };
 
     const text = this.buildLiveConsoleMessage(entry);
-    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: this.consoleButtons(callSid, entry) });
+    const initialMarkup = this.consoleButtons(callSid, entry);
+    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: initialMarkup });
     entry.messageId = response?.result?.message_id;
     entry.lastEditAt = new Date();
     entry.lastMessageText = text;
+    entry.lastMarkup = JSON.stringify(initialMarkup || {});
     this.liveConsoleByCallSid.set(callSid, entry);
     return entry;
   }
@@ -1023,12 +1025,15 @@ class EnhancedWebhookService {
     if (!entry || !entry.messageId) return;
     entry.lastEditAt = new Date();
     const text = this.buildLiveConsoleMessage(entry);
-    if (text === entry.lastMessageText) {
+    const markup = this.consoleButtons(callSid, entry);
+    const markupKey = JSON.stringify(markup || {});
+    if (text === entry.lastMessageText && markupKey === entry.lastMarkup) {
       return;
     }
     try {
-      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, this.consoleButtons(callSid, entry));
+      await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, markup);
       entry.lastMessageText = text;
+      entry.lastMarkup = markupKey;
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);

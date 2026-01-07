@@ -216,7 +216,7 @@ class EnhancedGptService extends EventEmitter {
 
     // Analyze customer message and adapt personality if needed
     if (role === 'user') {
-      console.log(`🔍 Analyzing message for adaptation...`.blue);
+      console.log(`Analyzing message for adaptation...`.blue);
       
       const adaptation = this.personalityEngine.adaptPersonality(text, this.conversationHistory);
       
@@ -262,6 +262,44 @@ class EnhancedGptService extends EventEmitter {
     let firstChunkAt = null;
     let stallTimer = null;
     let fillerSent = false;
+    const handleFailure = (err) => {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+      console.error('GPT completion error:', err);
+      this.emit('gpterror', err);
+
+      const fallbackResponse = 'I am having trouble replying right now • please give me a moment or try again.';
+      const fallbackReply = {
+        partialResponseIndex: this.partialResponseIndex,
+        partialResponse: fallbackResponse,
+        personalityInfo: this.personalityEngine.getCurrentPersonality(),
+        adaptationHistory: this.personalityChanges.slice(-3),
+        functionsAvailable: Object.keys(this.availableFunctions).length
+      };
+
+      this.emit('gptreply', fallbackReply, interactionCount);
+      this.partialResponseIndex++;
+
+      this.conversationHistory.push({
+        role: 'assistant',
+        content: fallbackResponse,
+        timestamp: new Date().toISOString(),
+        interactionCount: interactionCount,
+        personality: this.personalityEngine.currentPersonality,
+        functionsUsed: []
+      });
+
+      this.userContext.push({ role: 'assistant', content: fallbackResponse });
+      this.addToPhaseWindow({ role: 'assistant', content: fallbackResponse });
+
+      const finishedAt = Date.now();
+      const ttfb = firstChunkAt ? (firstChunkAt - startedAt) : null;
+      const rtt = finishedAt - startedAt;
+      this.recordLatency(ttfb, rtt);
+    };
+
     try {
       stallTimer = setTimeout(() => {
         if (!firstChunkAt && !fillerSent) {
@@ -278,9 +316,8 @@ class EnhancedGptService extends EventEmitter {
         stream: true,
       });
     } catch (err) {
-      if (stallTimer) clearTimeout(stallTimer);
-      this.emit('gpterror', err);
-      throw err;
+      handleFailure(err);
+      return;
     }
 
     let completeResponse = '';
@@ -381,37 +418,7 @@ class EnhancedGptService extends EventEmitter {
     }
 
     if (streamError) {
-      console.error('GPT stream error:', streamError);
-      this.emit('gpterror', streamError);
-
-      const fallbackResponse = 'I am having trouble replying right now • please give me a moment or try again.';
-      const fallbackReply = {
-        partialResponseIndex: this.partialResponseIndex,
-        partialResponse: fallbackResponse,
-        personalityInfo: this.personalityEngine.getCurrentPersonality(),
-        adaptationHistory: this.personalityChanges.slice(-3),
-        functionsAvailable: Object.keys(this.availableFunctions).length
-      };
-
-      this.emit('gptreply', fallbackReply, interactionCount);
-      this.partialResponseIndex++;
-
-      this.conversationHistory.push({
-        role: 'assistant',
-        content: fallbackResponse,
-        timestamp: new Date().toISOString(),
-        interactionCount: interactionCount,
-        personality: this.personalityEngine.currentPersonality,
-        functionsUsed: []
-      });
-
-      this.userContext.push({ role: 'assistant', content: fallbackResponse });
-      this.addToPhaseWindow({ role: 'assistant', content: fallbackResponse });
-
-      const finishedAt = Date.now();
-      const ttfb = firstChunkAt ? (firstChunkAt - startedAt) : null;
-      const rtt = finishedAt - startedAt;
-      this.recordLatency(ttfb, rtt);
+      handleFailure(streamError);
       return;
     }
 
