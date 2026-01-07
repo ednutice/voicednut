@@ -868,6 +868,7 @@ class EnhancedWebhookService {
     const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup: this.consoleButtons(callSid, entry) });
     entry.messageId = response?.result?.message_id;
     entry.lastEditAt = new Date();
+    entry.lastMessageText = text;
     this.liveConsoleByCallSid.set(callSid, entry);
     return entry;
   }
@@ -1022,8 +1023,12 @@ class EnhancedWebhookService {
     if (!entry || !entry.messageId) return;
     entry.lastEditAt = new Date();
     const text = this.buildLiveConsoleMessage(entry);
+    if (text === entry.lastMessageText) {
+      return;
+    }
     try {
       await this.editTelegramMessage(entry.chatId, entry.messageId, text, false, this.consoleButtons(callSid, entry));
+      entry.lastMessageText = text;
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);

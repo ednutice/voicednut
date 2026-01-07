@@ -706,19 +706,10 @@ app.ws('/connection', (ws) => {
               });
             } catch (dbError) {
               console.error('Database error adding AI transcript:', dbError);
-    }
-    
-    ttsService.generate(gptReply, icount);
-  });
-
-  gptService.on('stall', (fillerText) => {
-    webhookService.addLiveEvent(callSid, '⏳ One moment…', { force: true });
-    try {
-      ttsService.generate({ partialResponse: fillerText, personalityInfo: { name: 'filler' }, adaptationHistory: [] }, session.interactionCount);
-    } catch (err) {
-      console.error('Filler TTS error:', err);
-    }
-  });
+            }
+            
+            ttsService.generate(gptReply, icount);
+          });
 
           gptService.on('stall', (fillerText) => {
             webhookService.addLiveEvent(callSid, '⏳ One moment…', { force: true });
