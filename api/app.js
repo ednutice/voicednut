@@ -82,6 +82,7 @@ const digitCollectionManager = {
       mask_for_gpt: params.mask_for_gpt !== false,
       speak_confirmation: params.speak_confirmation || false,
       retries: 0,
+      buffer: '',
       collected: [],
       last_masked: null
     });
@@ -90,45 +91,78 @@ const digitCollectionManager = {
     if (!digits) return { accepted: false, reason: 'empty' };
     const exp = this.expectations.get(callSid);
     if (!exp) return { accepted: false, reason: 'no_expectation' };
-    const len = digits.length;
-    const inRange = len >= exp.min_digits && len <= exp.max_digits;
-    const masked = len <= 4 ? digits : `${'*'.repeat(Math.max(0, len - 4))}${digits.slice(-4)}`;
-    const result = { accepted: inRange, masked, profile: exp.profile, len, digits };
-    result.mask_for_gpt = exp.mask_for_gpt;
+    const result = { profile: exp.profile, mask_for_gpt: exp.mask_for_gpt };
 
     if (exp.profile === 'menu' && exp.menu_options.length) {
-      const hit = exp.menu_options.find((o) => String(o.digit) === digits);
+      const hit = exp.menu_options.find((o) => String(o.digit) === String(digits));
       if (hit) {
+        result.digits = String(digits);
+        result.len = result.digits.length;
+        result.masked = result.digits;
         result.route = hit.route || hit.label || `menu_${digits}`;
         result.accepted = true;
       } else {
         result.accepted = false;
         result.reason = 'invalid_menu_option';
       }
+      exp.collected.push(result.digits || digits);
+      exp.last_masked = result.masked || result.digits;
+      this.expectations.set(callSid, exp);
+      return result;
     }
 
-    exp.collected.push(digits);
+    exp.buffer = `${exp.buffer || ''}${String(digits)}`;
+    const len = exp.buffer.length;
+    const inRange = len >= exp.min_digits && len <= exp.max_digits;
+    const tooLong = len > exp.max_digits;
+    const masked = len <= 4 ? exp.buffer : `${'*'.repeat(Math.max(0, len - 4))}${exp.buffer.slice(-4)}`;
+
+    Object.assign(result, {
+      digits: exp.buffer,
+      len,
+      masked,
+      accepted: inRange && !tooLong
+    });
+
+    if (tooLong) {
+      result.accepted = false;
+      result.reason = 'too_long';
+      exp.buffer = '';
+    } else if (!result.accepted) {
+      result.reason = 'incomplete';
+    }
+
+    exp.collected.push(result.digits);
     exp.last_masked = masked;
+
     if (!result.accepted) {
       exp.retries += 1;
       result.retries = exp.retries;
       if (exp.retries > exp.max_retries) {
         result.fallback = true;
       }
+    } else {
+      // reset buffer after successful collection
+      exp.buffer = '';
     }
+
     this.expectations.set(callSid, exp);
     return result;
   }
 };
 
-async function handleCollectionResult(callSid, collection) {
+async function handleCollectionResult(callSid, collection, gptService = null) {
   if (!collection) return;
   const payload = {
     profile: collection.profile,
     raw_digits: collection.digits,
     masked: collection.masked,
     len: collection.len,
-    route: collection.route || null
+    route: collection.route || null,
+    accepted: !!collection.accepted,
+    retries: collection.retries || 0,
+    fallback: !!collection.fallback,
+    reason: collection.reason || null
   };
 
   try {
@@ -188,6 +222,17 @@ async function handleCollectionResult(callSid, collection) {
     if (collection.fallback) {
       webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
     }
+  }
+
+  if (gptService) {
+    const note = collection.accepted
+      ? collection.route
+        ? `Digit collection: menu route ${collection.route}`
+        : `Digit collection accepted (${collection.profile || 'generic'})`
+      : collection.fallback
+        ? `Digit collection failed after ${collection.retries} retries`
+        : `Digit collection invalid (${collection.reason || 'unknown'})`;
+    gptService.updateUserContext('digit_collection', 'system', note);
   }
 }
 
@@ -263,7 +308,7 @@ const telephonyTools = [
   }
 ];
 
-function buildTelephonyImplementations(callSid) {
+function buildTelephonyImplementations(callSid, gptService = null) {
   return {
     confirm_identity: async (args = {}) => {
       const payload = {
@@ -311,6 +356,9 @@ function buildTelephonyImplementations(callSid) {
         await db.updateCallState(callSid, 'digit_collection_requested', payload);
         webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
         digitCollectionManager.setExpectation(callSid, payload);
+        if (gptService) {
+          gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits. Prompt: ${payload.prompt}`);
+        }
       } catch (err) {
         console.error('collect_digits handler error:', err);
       }
@@ -331,7 +379,7 @@ function buildTelephonyImplementations(callSid) {
 
 function applyTelephonyTools(gptService, callSid, baseTools = [], baseImpl = {}) {
   const combinedTools = [...baseTools, ...telephonyTools];
-  const combinedImpl = { ...baseImpl, ...buildTelephonyImplementations(callSid) };
+  const combinedImpl = { ...baseImpl, ...buildTelephonyImplementations(callSid, gptService) };
   gptService.setDynamicFunctions(combinedTools, combinedImpl);
 }
 
@@ -684,7 +732,7 @@ app.ws('/connection', (ws) => {
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
             const personalityInfo = gptReply.personalityInfo || {};
-            console.log(`­${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`);
+            console.log(`${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`);
             webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
             webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
             
@@ -820,6 +868,17 @@ app.ws('/connection', (ws) => {
         } else if (msg.event === 'mark') {
           const label = msg.mark.name;
           marks = marks.filter(m => m !== msg.mark.name);
+        } else if (msg.event === 'dtmf') {
+          const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || '';
+          if (digits) {
+            webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
+            const collection = digitCollectionManager.recordDigits(callSid, digits);
+            await handleCollectionResult(callSid, collection, gptService);
+            if (collection.accepted && collection.route) {
+              webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
+              await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
+            }
+          }
         } else if (msg.event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
           
@@ -886,7 +945,7 @@ app.ws('/connection', (ws) => {
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
-        await handleCollectionResult(callSid, collection);
+        await handleCollectionResult(callSid, collection, gptService);
       }
       
       // Process with adaptive personality and functions
@@ -1041,7 +1100,7 @@ app.ws('/vonage/stream', (ws, req) => {
       if (codes && codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
-        await handleCollectionResult(callSid, collection);
+        await handleCollectionResult(callSid, collection, gptService);
       }
       try {
         await gptService.completion(sanitized, interactionCount);
@@ -1160,6 +1219,7 @@ app.ws('/aws/stream', (ws, req) => {
           webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
         }
+        await handleCollectionResult(callSid, collection, session.gptService);
       }
 
       try {

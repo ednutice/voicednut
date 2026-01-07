@@ -300,24 +300,35 @@ class EnhancedGptService extends EventEmitter {
       this.recordLatency(ttfb, rtt);
     };
 
-    try {
-      stallTimer = setTimeout(() => {
-        if (!firstChunkAt && !fillerSent) {
-          fillerSent = true;
-          this.emit('stall', this.fillerText);
-        }
-      }, this.stallTimeoutMs);
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        stallTimer = setTimeout(() => {
+          if (!firstChunkAt && !fillerSent) {
+            fillerSent = true;
+            this.emit('stall', this.fillerText);
+          }
+        }, this.stallTimeoutMs);
 
-      stream = await this.openai.chat.completions.create({
-        model: this.model,
-        messages,
-        tools: toolsToUse,
-        max_tokens: adaptiveMaxTokens,
-        stream: true,
-      });
-    } catch (err) {
-      handleFailure(err);
-      return;
+        stream = await this.openai.chat.completions.create({
+          model: this.model,
+          messages,
+          tools: toolsToUse,
+          max_tokens: adaptiveMaxTokens,
+          stream: true,
+        });
+        break; // success
+      } catch (err) {
+        if (attempt >= maxAttempts) {
+          handleFailure(err);
+          return;
+        }
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
     }
 
     let completeResponse = '';
