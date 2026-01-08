@@ -935,8 +935,9 @@ app.ws('/connection', (ws) => {
     ws.on('message', async function message(data) {
       try {
         const msg = JSON.parse(data);
+        const event = msg.event;
         
-        if (msg.event === 'start') {
+        if (event === 'start') {
           streamSid = msg.start.streamSid;
           callSid = msg.start.callSid;
           callStartTime = new Date();
@@ -1146,14 +1147,14 @@ app.ws('/connection', (ws) => {
             }
           }
 
-        } else if (msg.event === 'media') {
+        } else if (event === 'media') {
           if (isInitialized && transcriptionService) {
             transcriptionService.send(msg.media.payload);
           }
-        } else if (msg.event === 'mark') {
+        } else if (event === 'mark') {
           const label = msg.mark.name;
           marks = marks.filter(m => m !== msg.mark.name);
-        } else if (msg.event === 'dtmf') {
+        } else if (event === 'dtmf') {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || '';
           if (digits) {
             webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
@@ -1164,7 +1165,7 @@ app.ws('/connection', (ws) => {
               await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
             }
           }
-        } else if (msg.event === 'stop') {
+        } else if (event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
           
           await handleCallEnd(callSid, callStartTime);
@@ -1176,6 +1177,8 @@ app.ws('/connection', (ws) => {
             callFunctionSystems.delete(callSid);
             console.log(`Cleaned up adaptive configuration for call: ${callSid}`);
           }
+        } else {
+          console.log(`Unrecognized WS event for ${callSid || 'unknown'}: ${event || 'none'}`, msg);
         }
       } catch (messageError) {
         console.error('Error processing WebSocket message:', messageError);
@@ -1705,7 +1708,8 @@ app.post('/incoming', (req, res) => {
     }
     const response = new VoiceResponse();
     const connect = response.connect();
-    connect.stream({ url: `wss://${config.server.hostname}/connection` });
+    // Request both audio + DTMF events from Twilio Media Streams
+    connect.stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
 
     res.type('text/xml');
     res.end(response.toString());

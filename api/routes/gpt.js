@@ -198,6 +198,7 @@ class EnhancedGptService extends EventEmitter {
         }
       }
     }
+    return {};
   }
 
   updateUserContext(name, role, text) {
@@ -211,6 +212,15 @@ class EnhancedGptService extends EventEmitter {
 
   // Enhanced completion method with dynamic functions and personality adaptation
   async completion(text, interactionCount, role = 'user', name = 'user') {
+    // Normalize non-string inputs (e.g., function payload objects)
+    if (typeof text === 'object') {
+      try {
+        text = JSON.stringify(text);
+      } catch (_) {
+        text = String(text);
+      }
+    }
+
     if (!text || String(text).trim().length === 0) {
       return;
     }
