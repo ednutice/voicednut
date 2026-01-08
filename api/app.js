@@ -362,8 +362,23 @@ function warnOnInvalidTwilioSignature(req, label = '') {
   return valid;
 }
 
+function selectWsProtocol(protocols) {
+  if (!protocols) return false;
+  if (Array.isArray(protocols) && protocols.length) return protocols[0];
+  if (protocols instanceof Set) {
+    const iter = protocols.values().next();
+    return iter.done ? false : iter.value;
+  }
+  if (typeof protocols === 'string') return protocols;
+  return false;
+}
+
 const app = express();
-ExpressWs(app);
+ExpressWs(app, null, {
+  wsOptions: {
+    handleProtocols: (protocols) => selectWsProtocol(protocols)
+  }
+});
 // Trust the first proxy (ngrok/load balancer) so rate limiting can read X-Forwarded-For safely
 app.set('trust proxy', 1);
 
@@ -2568,7 +2583,13 @@ function handleTwilioIncoming(req, res) {
     const response = new VoiceResponse();
     const connect = response.connect();
     // Request both audio + DTMF events from Twilio Media Streams
-    connect.stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
+    connect.stream({
+      url: `wss://${host}/connection`,
+      track: 'both_tracks',
+      statusCallback: `https://${host}/webhook/twilio-stream`,
+      statusCallbackMethod: 'POST',
+      statusCallbackEvent: ['start', 'end']
+    });
 
     res.type('text/xml');
     res.end(response.toString());
@@ -3415,6 +3436,23 @@ app.post('/webhook/call-status', async (req, res) => {
     
     res.status(200).send('OK');
   }
+});
+
+// Twilio Media Stream status callback
+app.post('/webhook/twilio-stream', (req, res) => {
+  try {
+    const payload = req.body || {};
+    const callSid = payload.CallSid || payload.callSid || 'unknown';
+    const streamSid = payload.StreamSid || payload.streamSid || 'unknown';
+    const eventType = payload.EventType || payload.eventType || payload.event || 'unknown';
+    console.log(`Twilio stream status: callSid=${callSid} streamSid=${streamSid} event=${eventType}`);
+    if (Object.keys(payload).length > 0) {
+      console.log(`Twilio stream payload: ${JSON.stringify(payload)}`);
+    }
+  } catch (err) {
+    console.error('Twilio stream status webhook error:', err);
+  }
+  res.status(200).send('OK');
 });
 
 
