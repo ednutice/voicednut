@@ -148,7 +148,7 @@ function buildTwilioStreamTwiml(hostname) {
   const response = new VoiceResponse();
   const connect = response.connect();
   const host = hostname || config.server.hostname;
-  connect.stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
+  connect.stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
   return response.toString();
 }
 
@@ -424,6 +424,11 @@ const digitCollectionPlans = new Map();
 const callEndLocks = new Map();
 const silenceTimers = new Map();
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
+
+const ALLOWED_TWILIO_STREAM_TRACKS = new Set(['inbound_track', 'outbound_track', 'both_tracks']);
+const TWILIO_STREAM_TRACK = ALLOWED_TWILIO_STREAM_TRACKS.has((process.env.TWILIO_STREAM_TRACK || '').toLowerCase())
+  ? process.env.TWILIO_STREAM_TRACK.toLowerCase()
+  : 'inbound_track';
 
 const DEFAULT_COLLECT_DELAY_MS = 1200;
 
@@ -1665,6 +1670,7 @@ async function startServer() {
       console.log(`✅ Enhanced Adaptive API server running on port ${PORT}`);
       console.log(`🎭 System ready - Personality Engine & Dynamic Functions active`);
       console.log(`📡 Enhanced webhook notifications enabled`);
+      console.log(`📞 Twilio Media Stream track mode: ${TWILIO_STREAM_TRACK}`);
     });
 
   } catch (error) {
@@ -2585,7 +2591,7 @@ function handleTwilioIncoming(req, res) {
     // Request both audio + DTMF events from Twilio Media Streams
     connect.stream({
       url: `wss://${host}/connection`,
-      track: 'both_tracks',
+      track: TWILIO_STREAM_TRACK,
       statusCallback: `https://${host}/webhook/twilio-stream`,
       statusCallbackMethod: 'POST',
       statusCallbackEvent: ['start', 'end']
@@ -4447,7 +4453,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       const response = new VoiceResponse();
       const host = resolveHost(req);
       response.say('One moment please.');
-      response.connect().stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
+      response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
       res.type('text/xml');
       res.end(response.toString());
       return;
@@ -4478,7 +4484,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           response.hangup();
         } else {
           response.say('Thanks, continuing.');
-          response.connect().stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
+          response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
         }
         clearDigitFallbackState(callSid);
         res.type('text/xml');
@@ -4492,7 +4498,8 @@ app.post('/webhook/twilio-gather', async (req, res) => {
         response.hangup();
       } else {
         response.say('That did not go through. Please try again.');
-        response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+        const host = resolveHost(req);
+        response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
       }
       clearDigitFallbackState(callSid);
       res.type('text/xml');
