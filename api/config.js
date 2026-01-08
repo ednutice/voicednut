@@ -31,6 +31,21 @@ function ensure(name, fallback) {
   return '';
 }
 
+function normalizeHostname(value) {
+  if (!value) return '';
+  const trimmed = String(value).trim();
+  if (!trimmed) return '';
+  try {
+    if (trimmed.includes('://')) {
+      const parsed = new URL(trimmed);
+      return parsed.host;
+    }
+  } catch {
+    // fall through to basic cleanup
+  }
+  return trimmed.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
 const corsOriginsRaw = ensure('CORS_ORIGINS', process.env.WEB_APP_URL || '');
 const corsOrigins = corsOriginsRaw
   .split(',')
@@ -85,6 +100,7 @@ function loadPrivateKey(rawValue) {
 }
 
 const vonagePrivateKey = loadPrivateKey(readEnv('VONAGE_PRIVATE_KEY'));
+const serverHostname = normalizeHostname(ensure('SERVER', ''));
 
 module.exports = {
   platform: {
@@ -157,7 +173,7 @@ module.exports = {
   },
   server: {
     port: Number(ensure('PORT', '3000')),
-    hostname: ensure('SERVER', ''),
+    hostname: serverHostname,
     corsOrigins,
     rateLimit: {
       windowMs: Number(ensure('RATE_LIMIT_WINDOW_MS', '60000')),

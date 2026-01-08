@@ -241,6 +241,9 @@ class EnhancedWebhookService {
           if (['ringing', 'answered', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'].includes(persisted)) {
             return;
           }
+          if (call?.started_at || (typeof call?.duration === 'number' && call.duration > 0)) {
+            return;
+          }
         } catch {
           // best-effort fallback
         }
@@ -1137,6 +1140,11 @@ class EnhancedWebhookService {
       entry.lastMarkup = markupKey;
     } catch (error) {
       const telegramError = error?.response?.data?.description || error.message;
+      if (telegramError && telegramError.includes('message is not modified')) {
+        entry.lastMessageText = text;
+        entry.lastMarkup = markupKey;
+        return;
+      }
       console.error(`❌ Live console edit failed (callSid=${callSid}, messageId=${entry.messageId}): ${telegramError}`);
       // No noisy notifications; rely on next successful update
     }
@@ -1266,23 +1274,31 @@ class EnhancedWebhookService {
     const { callTiming, callDetails, statusInfo, additionalData } = context || {};
     const history = statusInfo?.statusHistory || [];
     const mediaEvidence = this.mediaSeen.get(context?.callSid) || false;
+    const persistedStatus = String(callDetails?.status || callDetails?.twilio_status || '').toLowerCase();
+    const durationEvidence = Number.isFinite(Number(callDetails?.duration)) && Number(callDetails?.duration) > 0;
     const answeredEvidence = !!(
       callTiming?.answered ||
       callDetails?.started_at ||
       history.includes('answered') ||
       history.includes('in-progress') ||
-      mediaEvidence
+      mediaEvidence ||
+      ['answered', 'in-progress', 'completed'].includes(persistedStatus) ||
+      durationEvidence
     );
 
     if (normalizedStatus === 'in-progress' && !answeredEvidence) {
       return 'ringing';
     }
 
+    if ((normalizedStatus === 'no-answer' || normalizedStatus === 'no_answer') && answeredEvidence) {
+      return 'completed';
+    }
+
     if (normalizedStatus === 'completed') {
       const duration = typeof additionalData.duration === 'number' ? additionalData.duration : null;
-      const shortCall = duration !== null ? duration < 3 : false;
+      const durationConfirmed = typeof duration === 'number' && duration > 0;
       const noAnsweredHistory = !answeredEvidence && !history.includes('completed');
-      if (!answeredEvidence || (shortCall && !mediaEvidence)) {
+      if ((!answeredEvidence && !durationConfirmed) || noAnsweredHistory) {
         return 'no-answer';
       }
     }

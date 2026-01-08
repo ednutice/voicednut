@@ -19,6 +19,7 @@ const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
 const config = require('./config');
 const { AwsConnectAdapter, AwsTtsAdapter, VonageVoiceAdapter } = require('./adapters');
 const { v4: uuidv4 } = require('uuid');
+const apiPackage = require('./package.json');
 
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -275,6 +276,9 @@ function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) 
 function shouldBypassHmac(req) {
   const path = req.path || '';
   if (!path) return false;
+  if (req.method === 'GET' && (path === '/' || path === '/favicon.ico' || path === '/health')) {
+    return true;
+  }
   if (path.startsWith('/webhook/')) return true;
   return HMAC_BYPASS_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
@@ -350,6 +354,8 @@ function warnOnInvalidTwilioSignature(req, label = '') {
 
 const app = express();
 ExpressWs(app);
+// Trust the first proxy (ngrok/load balancer) so rate limiting can read X-Forwarded-For safely
+app.set('trust proxy', 1);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -419,10 +425,14 @@ function getDigitProfileDefaults(profile = 'generic') {
 }
 
 function normalizeDigitExpectation(params = {}) {
-  const promptHint = String(params.prompt || '').toLowerCase();
+  const promptHint = `${params.prompt || ''} ${params.prompt_hint || ''}`.toLowerCase();
   let profile = String(params.profile || 'generic').toLowerCase();
   if (profile === 'generic' && promptHint.match(/\b(code|otp|verification|verify|passcode|pin)\b/)) {
     profile = 'verification';
+  } else if (profile === 'generic' && promptHint.match(/\b(press|option|menu)\b/)) {
+    profile = 'menu';
+  } else if (profile === 'generic' && promptHint.match(/\b(rate|rating|survey|feedback)\b/)) {
+    profile = 'survey';
   }
   const defaults = getDigitProfileDefaults(profile);
   const minDigits = typeof params.min_digits === 'number'
@@ -822,7 +832,11 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
 async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
   if (!plan || !Array.isArray(plan.steps) || plan.index >= plan.steps.length) return;
   const step = plan.steps[plan.index];
-  const payload = normalizeDigitExpectation(step);
+  const callConfig = callConfigurations.get(callSid);
+  const promptHint = [step?.prompt, callConfig?.first_message, callConfig?.prompt]
+    .filter(Boolean)
+    .join(' ');
+  const payload = normalizeDigitExpectation({ ...step, prompt_hint: promptHint });
   payload.plan_id = plan.id;
   payload.plan_step_index = plan.index + 1;
   payload.plan_total_steps = plan.steps.length;
@@ -999,7 +1013,11 @@ function buildTelephonyImplementations(callSid, gptService = null) {
       if (digitCollectionPlans.has(callSid)) {
         clearDigitPlan(callSid);
       }
-      const payload = normalizeDigitExpectation(args);
+      const callConfig = callConfigurations.get(callSid);
+      const promptHint = [args.prompt, callConfig?.first_message, callConfig?.prompt]
+        .filter(Boolean)
+        .join(' ');
+      const payload = normalizeDigitExpectation({ ...args, prompt_hint: promptHint });
       try {
         await db.updateCallState(callSid, 'digit_collection_requested', payload);
         webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
@@ -1998,6 +2016,13 @@ app.ws('/connection', (ws) => {
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
       webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+      if (callSid) {
+        db.updateCallState(callSid, 'tts_ready', {
+          response_index: responseIndex,
+          interaction_count: icount,
+          audio_bytes: audio?.length || null
+        }).catch(() => {});
+      }
       streamService.buffer(responseIndex, audio);
     });
   
@@ -2117,6 +2142,14 @@ app.ws('/vonage/stream', (ws, req) => {
 
     ttsService.on('speech', (responseIndex, audio) => {
       webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+      if (callSid) {
+        db.updateCallState(callSid, 'tts_ready', {
+          response_index: responseIndex,
+          interaction_count: interactionCount,
+          audio_bytes: audio?.length || null,
+          provider: 'vonage'
+        }).catch(() => {});
+      }
       try {
         const buffer = Buffer.from(audio, 'base64');
         ws.send(buffer);
@@ -3135,6 +3168,11 @@ app.post('/webhook/call-status', async (req, res) => {
     console.log(`CallDuration: ${CallDuration || 'N/A'}`);
     console.log(`DialCallDuration: ${DialCallDuration || 'N/A'}`);
     console.log(`AnsweredBy: ${AnsweredBy || 'N/A'}`);
+
+    const durationCandidates = [Duration, CallDuration, DialCallDuration]
+      .map((value) => parseInt(value, 10))
+      .filter((value) => Number.isFinite(value));
+    const durationValue = durationCandidates.length ? Math.max(...durationCandidates) : 0;
     
     // Get call details from database
     const call = await db.getCall(CallSid);
@@ -3151,26 +3189,26 @@ app.post('/webhook/call-status', async (req, res) => {
     
     // Special handling for "completed" status - check if it was actually answered
     if (actualStatus === 'completed') {
-      const duration = parseInt(Duration || CallDuration || DialCallDuration || 0);
       const priorStatus = String(call.status || '').toLowerCase();
       const hasAnswerEvidence =
         !!call.started_at ||
-        ['answered', 'in-progress', 'completed'].includes(priorStatus);
+        ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
+        durationValue > 0;
       
-      console.log(`Analyzing completed call: Duration = ${duration}s`);
+      console.log(`Analyzing completed call: Duration = ${durationValue}s`);
       
       // If call completed but duration is very short (< 3 seconds), it's likely no-answer
       // unless we already recorded an answer signal
-      if ((duration === 0 || duration < 3) && !hasAnswerEvidence) {
-        console.log(`Short duration detected (${duration}s) - treating as no-answer`.red);
+      if ((durationValue === 0 || durationValue < 3) && !hasAnswerEvidence) {
+        console.log(`Short duration detected (${durationValue}s) - treating as no-answer`.red);
         actualStatus = 'no-answer';
         notificationType = 'call_no_answer';
-      } else if (AnsweredBy === 'machine_start' && duration < 10 && !hasAnswerEvidence) {
+      } else if (AnsweredBy === 'machine_start' && durationValue < 10 && !hasAnswerEvidence) {
         console.log(`Voicemail detected with short duration - treating as no-answer`.red);
         actualStatus = 'no-answer';
         notificationType = 'call_no_answer';
       } else {
-        console.log(`Valid call duration (${duration}s) - confirmed answered`);
+        console.log(`Valid call duration (${durationValue}s) - confirmed answered`);
         actualStatus = 'completed';
         notificationType = 'call_completed';
       }
@@ -3208,11 +3246,22 @@ app.post('/webhook/call-status', async (req, res) => {
       }
     }
 
+    const priorStatus = String(call.status || '').toLowerCase();
+    const hasAnswerEvidence = !!call.started_at ||
+      ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
+      durationValue > 0 ||
+      !!AnsweredBy;
+
+    if (actualStatus === 'no-answer' && hasAnswerEvidence) {
+      actualStatus = 'completed';
+      notificationType = 'call_completed';
+    }
+
     console.log(`Final determination: ${CallStatus} → ${actualStatus} → ${notificationType}`);
 
     // Update call status in database with enhanced data
     const updateData = {
-      duration: parseInt(Duration || CallDuration || DialCallDuration || 0),
+      duration: durationValue,
       twilio_status: CallStatus,
       answered_by: AnsweredBy,
       error_code: ErrorCode,
@@ -3360,8 +3409,8 @@ app.get('/api/calls/:callSid', async (req, res) => {
     
     res.json({
       call,
-      transcripts: fullTranscripts,
-      transcript_count: fullTranscripts.length,
+      transcripts,
+      transcript_count: transcripts.length,
       adaptation_analytics: adaptationData,
       business_context: call.business_context ? JSON.parse(call.business_context) : null,
       webhook_notifications: webhookNotifications,
@@ -3450,6 +3499,65 @@ app.get('/api/calls/:callSid/status', async (req, res) => {
   } catch (error) {
     console.error('Error fetching enhanced call status:', error);
     res.status(500).json({ error: 'Failed to fetch call status' });
+  }
+});
+
+// Call latency diagnostics endpoint (best-effort)
+app.get('/api/calls/:callSid/latency', async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const call = await db.getCall(callSid);
+    if (!call) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    const states = await new Promise((resolve, reject) => {
+      db.db.all(
+        `SELECT state, timestamp FROM call_states
+         WHERE call_sid = ?
+           AND state IN ('user_spoke', 'ai_responded', 'tts_ready')
+         ORDER BY timestamp DESC`,
+        [callSid],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows || []);
+        }
+      );
+    });
+
+    const latest = { user_spoke: null, ai_responded: null, tts_ready: null };
+    for (const row of states) {
+      if (!latest[row.state]) {
+        latest[row.state] = row;
+      }
+    }
+
+    const toMs = (row) => (row?.timestamp ? new Date(row.timestamp).getTime() : null);
+    const userSpokeAt = toMs(latest.user_spoke);
+    const aiRespondedAt = toMs(latest.ai_responded);
+    const ttsReadyAt = toMs(latest.tts_ready);
+
+    const gptMs = userSpokeAt && aiRespondedAt && aiRespondedAt >= userSpokeAt
+      ? aiRespondedAt - userSpokeAt
+      : null;
+    const ttsMs = aiRespondedAt && ttsReadyAt && ttsReadyAt >= aiRespondedAt
+      ? ttsReadyAt - aiRespondedAt
+      : null;
+
+    res.json({
+      call_sid: callSid,
+      latency_metrics: {
+        stt_ms: null,
+        gpt_ms: gptMs,
+        tts_ms: ttsMs
+      },
+      call_duration: call.duration || 0,
+      source: 'call_states',
+      computed_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching call latency:', error);
+    res.status(500).json({ error: 'Failed to fetch call latency' });
   }
 });
 
@@ -3665,6 +3773,16 @@ app.post('/api/generate-functions', async (req, res) => {
     console.error('Error generating enhanced functions:', error);
     res.status(500).json({ error: 'Failed to generate functions' });
   }
+});
+
+// Version info endpoint for bot diagnostics
+app.get('/api/version', (req, res) => {
+  res.json({
+    name: apiPackage.name || 'api',
+    version: apiPackage.version || 'unknown',
+    provider: currentProvider,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Enhanced health endpoint with comprehensive system status
