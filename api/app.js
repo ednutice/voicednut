@@ -2547,15 +2547,14 @@ function generateCallSummary(transcripts, duration) {
   return { summary, analysis };
 }
 
-// Incoming endpoint used by Twilio to connect the call to our websocket stream
-app.post('/incoming', (req, res) => {
+function handleTwilioIncoming(req, res) {
   try {
     warnOnInvalidTwilioSignature(req, '/incoming');
     const host = resolveHost(req);
     if (!host) {
       return res.status(500).send('Server hostname not configured');
     }
-    console.log(`Incoming call webhook from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'}`);
+    console.log(`Incoming call webhook (${req.method}) from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'} host=${host}`);
     const callSid = req.body?.CallSid;
     if (callSid) {
       const timeout = setTimeout(() => {
@@ -2577,7 +2576,11 @@ app.post('/incoming', (req, res) => {
     console.log(err);
     res.status(500).send('Error');
   }
-});
+}
+
+// Incoming endpoint used by Twilio to connect the call to our websocket stream
+app.post('/incoming', handleTwilioIncoming);
+app.get('/incoming', handleTwilioIncoming);
 
 // Telegram callback webhook (live console actions)
 app.post('/webhook/telegram', async (req, res) => {
@@ -3028,19 +3031,26 @@ app.post('/outbound-call', async (req, res) => {
       const accountSid = config.twilio.accountSid;
       const authToken = config.twilio.authToken;
       const fromNumber = config.twilio.fromNumber;
+      const host = resolveHost(req) || config.server?.hostname;
 
       if (!accountSid || !authToken || !fromNumber) {
         return res.status(500).json({
           error: 'Twilio credentials not configured'
         });
       }
+      if (!host) {
+        return res.status(500).json({ error: 'Server hostname not configured' });
+      }
 
       const client = twilio(accountSid, authToken);
+      const twimlUrl = `https://${host}/incoming`;
+      const statusUrl = `https://${host}/webhook/call-status`;
+      console.log(`Twilio call URLs: twiml=${twimlUrl} statusCallback=${statusUrl}`);
       const call = await client.calls.create({
-        url: `https://${config.server.hostname}/incoming`,
+        url: twimlUrl,
         to: number,
         from: fromNumber,
-        statusCallback: `https://${config.server.hostname}/webhook/call-status`,
+        statusCallback: statusUrl,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
         statusCallbackMethod: 'POST'
       });
