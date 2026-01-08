@@ -1658,12 +1658,17 @@ async function startServer() {
 }
 
 // Enhanced WebSocket connection handler with dynamic functions
-app.ws('/connection', (ws) => {
-  console.log('New WebSocket connection established');
+app.ws('/connection', (ws, req) => {
+  const ua = req?.headers?.['user-agent'] || 'unknown-ua';
+  const host = req?.headers?.host || 'unknown-host';
+  console.log(`New WebSocket connection established (host=${host}, ua=${ua})`);
   
   try {
     ws.on('error', (error) => {
       console.error('WebSocket error:', error);
+    });
+    ws.on('close', (code, reason) => {
+      console.warn(`WebSocket closed code=${code} reason=${reason?.toString() || ''}`);
     });
 
     let streamSid;
