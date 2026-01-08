@@ -408,7 +408,8 @@ const DIGIT_PROFILE_DEFAULTS = {
   card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', prompt: 'Please enter the card number using your keypad.' },
   card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
   zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Please enter the ZIP code using your keypad.' },
-  extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, prompt: 'Enter the extension using your keypad.' }
+  extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Enter the extension using your keypad.' },
+  menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Please press a keypad option now.' }
 };
 
 const CALL_END_MESSAGES = {
@@ -455,6 +456,9 @@ function normalizeDigitExpectation(params = {}) {
     : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
   const speakConfirmation = typeof params.speak_confirmation === 'boolean' ? params.speak_confirmation : false;
   const confirmationStyle = params.confirmation_style || defaults.confirmation_style || 'none';
+  const endCallOnSuccess = typeof params.end_call_on_success === 'boolean'
+    ? params.end_call_on_success
+    : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : true);
   const prompt = params.prompt && String(params.prompt).trim().length > 0
     ? params.prompt
     : (defaults.prompt || 'Please enter the digits now.');
@@ -479,7 +483,8 @@ function normalizeDigitExpectation(params = {}) {
     confirmation_style: confirmationStyle,
     allow_spoken_fallback: params.allow_spoken_fallback !== false,
     mask_for_gpt: maskForGpt,
-    speak_confirmation: speakConfirmation
+    speak_confirmation: speakConfirmation,
+    end_call_on_success: endCallOnSuccess
   };
 }
 
@@ -777,7 +782,8 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       }
     }
 
-    if (allowCallEnd) {
+    const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
+    if (shouldEndCall) {
       await speakAndEndCall(callSid, CALL_END_MESSAGES.success, 'digits_collected');
       return;
     }
@@ -2410,8 +2416,7 @@ async function handleCallEnd(callSid, callStartTime) {
     clearSilenceTimer(callSid);
     clearDigitPlan(callSid);
 
-    const transcripts = await db.getCallTranscripts(callSid);
-    const fullTranscripts = transcripts || [];
+    const transcripts = (await db.getCallTranscripts(callSid)) || [];
     const maskedTranscripts = transcripts.map((entry) => ({
       ...entry,
       message: maskOtpForExternal(entry.message)
@@ -4354,13 +4359,15 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       return res.status(400).send('Missing CallSid');
     }
 
-    const expectation = digitCollectionManager.expectations.get(callSid) || {
-      min_digits: 1,
-      max_digits: 6,
-      timeout_s: 10,
-      max_retries: 2,
-      prompt: 'Please enter the code now.'
-    };
+    const expectation = digitCollectionManager.expectations.get(callSid);
+    if (!expectation) {
+      const response = new VoiceResponse();
+      response.say('One moment please.');
+      response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+      res.type('text/xml');
+      res.end(response.toString());
+      return;
+    }
 
     const digits = String(Digits || '').trim();
     if (digits) {
