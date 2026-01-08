@@ -191,7 +191,11 @@ class EnhancedGptService extends EventEmitter {
     } catch (error) {
       console.log('Warning: Double function arguments returned by OpenRouter:', args);
       if (args.indexOf('{') != args.lastIndexOf('{')) {
-        return JSON.parse(args.substring(args.indexOf(''), args.indexOf('}') + 1));
+        const start = args.indexOf('{');
+        const end = args.lastIndexOf('}');
+        if (start !== -1 && end !== -1 && end > start) {
+          return JSON.parse(args.substring(start, end + 1));
+        }
       }
     }
   }

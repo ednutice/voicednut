@@ -4,6 +4,8 @@ require('colors');
 const express = require('express');
 const ExpressWs = require('express-ws');
 const path = require('path');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 const { EnhancedGptService } = require('./routes/gpt');
 const { StreamService } = require('./routes/stream');
@@ -32,6 +34,150 @@ if (!console.__emojiWrapped) {
   console.__emojiWrapped = true;
 }
 
+const HMAC_HEADER_TIMESTAMP = 'x-api-timestamp';
+const HMAC_HEADER_SIGNATURE = 'x-api-signature';
+const HMAC_BYPASS_PATH_PREFIXES = ['/webhook/', '/incoming', '/aws/transcripts', '/connection', '/vonage/stream', '/aws/stream'];
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((item) => (item === undefined ? 'null' : stableStringify(item)));
+    return `[${items.join(',')}]`;
+  }
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
+  const entries = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
+  return `{${entries.join(',')}}`;
+}
+
+function normalizeBodyForSignature(req) {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (['GET', 'HEAD'].includes(method)) {
+    return '';
+  }
+  const contentLength = Number(req.headers['content-length'] || 0);
+  const hasBody = Number.isFinite(contentLength) && contentLength > 0;
+  if (!req.body || Object.keys(req.body).length === 0) {
+    return hasBody ? stableStringify(req.body || {}) : '';
+  }
+  return stableStringify(req.body);
+}
+
+function buildHmacPayload(req, timestamp) {
+  const method = String(req.method || 'GET').toUpperCase();
+  const path = req.originalUrl || req.url || '/';
+  const body = normalizeBodyForSignature(req);
+  return `${timestamp}.${method}.${path}.${body}`;
+}
+
+function clearDigitTimeout(callSid) {
+  const timer = digitTimeouts.get(callSid);
+  if (timer) {
+    clearTimeout(timer);
+    digitTimeouts.delete(callSid);
+  }
+}
+
+function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) {
+  const exp = digitCollectionManager.expectations.get(callSid);
+  if (!exp || !exp.timeout_s) return;
+
+  clearDigitTimeout(callSid);
+
+  const timer = setTimeout(async () => {
+    const current = digitCollectionManager.expectations.get(callSid);
+    if (!current) return;
+
+    current.retries = (current.retries || 0) + 1;
+    digitCollectionManager.expectations.set(callSid, current);
+
+    const expectedText = `${current.min_digits || ''}${current.max_digits ? `-${current.max_digits}` : ''}`.replace(/-$/, '');
+    const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
+    const prompt = current.retries > current.max_retries
+      ? 'I could not verify the code. I will connect you to a specialist now.'
+      : `I didn’t catch that. Please re-enter the ${expectedLabel} using your keypad.`;
+
+    const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
+    const reply = {
+      partialResponseIndex: null,
+      partialResponse: prompt,
+      personalityInfo,
+      adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
+    };
+
+    if (gptService) {
+      gptService.emit('gptreply', reply, interactionCount);
+      try {
+        gptService.updateUserContext('digit_timeout', 'system', `Digit timeout retry ${current.retries}/${current.max_retries}`);
+      } catch (_) {}
+    }
+
+    webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
+
+    if (current.retries > current.max_retries) {
+      digitCollectionManager.expectations.delete(callSid);
+      clearDigitTimeout(callSid);
+      await db.updateCallState(callSid, 'route_requested', { reason: 'digit_collection_timeout', via: 'auto' }).catch(() => {});
+      return;
+    }
+
+    scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+  }, (exp.timeout_s || 20) * 1000);
+
+  digitTimeouts.set(callSid, timer);
+}
+
+function shouldBypassHmac(req) {
+  const path = req.path || '';
+  if (!path) return false;
+  if (path.startsWith('/webhook/')) return true;
+  return HMAC_BYPASS_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+function verifyHmacSignature(req) {
+  const secret = config.apiAuth?.hmacSecret;
+  if (!secret) {
+    return { ok: true, skipped: true, reason: 'missing_secret' };
+  }
+
+  const timestampHeader = req.headers[HMAC_HEADER_TIMESTAMP];
+  const signatureHeader = req.headers[HMAC_HEADER_SIGNATURE];
+
+  if (!timestampHeader || !signatureHeader) {
+    return { ok: false, reason: 'missing_headers' };
+  }
+
+  const timestamp = Number(timestampHeader);
+  if (!Number.isFinite(timestamp)) {
+    return { ok: false, reason: 'invalid_timestamp' };
+  }
+
+  const maxSkewMs = Number(config.apiAuth?.maxSkewMs || 300000);
+  const now = Date.now();
+  if (Math.abs(now - timestamp) > maxSkewMs) {
+    return { ok: false, reason: 'timestamp_out_of_range' };
+  }
+
+  const payload = buildHmacPayload(req, String(timestampHeader));
+  const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+
+  try {
+    const expectedBuf = Buffer.from(expected, 'hex');
+    const providedBuf = Buffer.from(String(signatureHeader), 'hex');
+    if (expectedBuf.length !== providedBuf.length) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+    if (!crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      return { ok: false, reason: 'invalid_signature' };
+    }
+  } catch (error) {
+    return { ok: false, reason: 'invalid_signature' };
+  }
+
+  return { ok: true };
+}
+
 function getTwilioWebhookUrl(req) {
   if (!config.server?.hostname) {
     return null;
@@ -49,11 +195,47 @@ function validateTwilioRequest(req) {
   return twilio.validateRequest(authToken, signature, url, req.body);
 }
 
+function warnOnInvalidTwilioSignature(req, label = '') {
+  const valid = validateTwilioRequest(req);
+  if (!valid) {
+    const path = label || req.originalUrl || req.path || 'unknown';
+    console.warn(`⚠️ Twilio signature invalid for ${path}`);
+  }
+  return valid;
+}
+
 const app = express();
 ExpressWs(app);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+const apiLimiter = rateLimit({
+  windowMs: config.server?.rateLimit?.windowMs || 60000,
+  max: config.server?.rateLimit?.max || 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use((req, res, next) => {
+  if (shouldBypassHmac(req)) {
+    return next();
+  }
+
+  const verification = verifyHmacSignature(req);
+  if (!verification.ok) {
+    console.warn(`⚠️ Rejected request due to invalid HMAC (${verification.reason}) ${req.method} ${req.originalUrl}`);
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  return next();
+});
+
+app.use((req, res, next) => {
+  if (shouldBypassHmac(req)) {
+    return next();
+  }
+  return apiLimiter(req, res, next);
+});
 
 const PORT = config.server?.port || 3000;
 
@@ -61,6 +243,7 @@ const PORT = config.server?.port || 3000;
 const callConfigurations = new Map();
 const activeCalls = new Map();
 const callFunctionSystems = new Map(); // Store generated functions per call
+const digitTimeouts = new Map();
 
 let db;
 const functionEngine = new DynamicFunctionEngine();
@@ -135,7 +318,7 @@ const digitCollectionManager = {
     exp.collected.push(result.digits);
     exp.last_masked = masked;
 
-    if (!result.accepted) {
+    if (!result.accepted && result.reason !== 'incomplete') {
       exp.retries += 1;
       result.retries = exp.retries;
       if (exp.retries > exp.max_retries) {
@@ -193,6 +376,7 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
   };
 
   if (collection.accepted) {
+    clearDigitTimeout(callSid);
     digitCollectionManager.expectations.delete(callSid);
     switch (collection.profile) {
       case 'menu':
@@ -242,6 +426,7 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
     if (collection.fallback) {
       webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
       digitCollectionManager.expectations.delete(callSid);
+      clearDigitTimeout(callSid);
       emitReply('I could not verify the code. I will connect you to a specialist now.');
       await db.updateCallState(callSid, 'route_requested', { reason: 'digit_collection_failed', via: 'auto' }).catch(() => {});
     } else {
@@ -252,6 +437,7 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       ];
       const prompt = prompts[Math.floor(Math.random() * prompts.length)];
       emitReply(prompt);
+      scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
     }
   }
 
@@ -386,6 +572,7 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         await db.updateCallState(callSid, 'digit_collection_requested', payload);
         webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
         digitCollectionManager.setExpectation(callSid, payload);
+        scheduleDigitTimeout(callSid, gptService, 0);
         if (gptService) {
           const instruction = `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
           const reply = {
@@ -440,15 +627,35 @@ function buildRecapSmsBody(call) {
   return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
 }
 
-function sanitizeOtpText(text = '', callSid = null) {
-  if (!text) return { sanitized: text, otpDetected: false, codes: [] };
+const OTP_REGEX = /\b\d{4,8}\b/g;
+
+function getOtpContext(text = '', callSid = null) {
+  if (!text) {
+    return {
+      raw: text,
+      maskedForGpt: text,
+      maskedForLogs: text,
+      otpDetected: false,
+      codes: []
+    };
+  }
   const expectation = callSid ? digitCollectionManager.expectations.get(callSid) : null;
   const maskForGpt = expectation ? expectation.mask_for_gpt !== false : true;
-  const otpRegex = /\b\d{4,8}\b/g;
-  const codes = [...text.matchAll(otpRegex)].map((m) => m[0]);
+  const codes = [...text.matchAll(OTP_REGEX)].map((m) => m[0]);
   const otpDetected = codes.length > 0;
-  const sanitized = maskForGpt ? text.replace(otpRegex, '******') : text;
-  return { sanitized, otpDetected, codes };
+  const masked = text.replace(OTP_REGEX, '******');
+  return {
+    raw: text,
+    maskedForGpt: maskForGpt ? masked : text,
+    maskedForLogs: masked,
+    otpDetected,
+    codes
+  };
+}
+
+function maskOtpForExternal(text = '') {
+  if (!text) return text;
+  return text.replace(OTP_REGEX, '******');
 }
 
 function shouldCloseConversation(text = '') {
@@ -994,51 +1201,50 @@ app.ws('/connection', (ws) => {
       if (!text || !gptService || !isInitialized) { 
         return; 
       }
-      
-      console.log(`Customer: ${text}`);
-      
+
+      const otpContext = getOtpContext(text, callSid);
+      console.log(`Customer: ${otpContext.maskedForLogs}`);
+
       // Save user transcript with enhanced context
       try {
-        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount
         });
         
         await db.updateCallState(callSid, 'user_spoke', {
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount,
-          otp_detected: otpDetected,
-          last_collected_code: codes?.slice(-1)[0] || null,
-          collected_codes: codes?.join(', ') || null
+          otp_detected: otpContext.otpDetected,
+          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+          collected_codes: otpContext.codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
       
-      const { sanitized, codes } = sanitizeOtpText(text, callSid);
-      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
-      if (codes && codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+      if (otpContext.codes && otpContext.codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
         await handleCollectionResult(callSid, collection, gptService, interactionCount);
       }
 
-      if (!sanitized || !sanitized.trim()) {
+      if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
         return;
       }
 
-      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+      if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
         gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
         gptService.setPhase('closing');
       }
       
       // Process with adaptive personality and functions
       try {
-        await gptService.completion(sanitized, interactionCount);
+        await gptService.completion(otpContext.maskedForGpt, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
@@ -1057,6 +1263,7 @@ app.ws('/connection', (ws) => {
 
     ws.on('close', () => {
       console.log(`WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`);
+      clearDigitTimeout(callSid);
     });
 
   } catch (err) {
@@ -1177,41 +1384,40 @@ app.ws('/vonage/stream', (ws, req) => {
 
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
+      const otpContext = getOtpContext(text, callSid);
       try {
-        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount
         });
         await db.updateCallState(callSid, 'user_spoke', {
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount,
-          otp_detected: otpDetected,
-          last_collected_code: codes?.slice(-1)[0] || null,
-          collected_codes: codes?.join(', ') || null
+          otp_detected: otpContext.otpDetected,
+          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+          collected_codes: otpContext.codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
-      const { sanitized, codes } = sanitizeOtpText(text, callSid);
-      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
-      if (codes && codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+      if (otpContext.codes && otpContext.codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
         await handleCollectionResult(callSid, collection, gptService, interactionCount);
       }
-      if (!sanitized || !sanitized.trim()) {
+      if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
         return;
       }
-      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+      if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
         gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
         gptService.setPhase('closing');
       }
       try {
-        await gptService.completion(sanitized, interactionCount);
+        await gptService.completion(otpContext.maskedForGpt, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
@@ -1242,6 +1448,7 @@ app.ws('/vonage/stream', (ws, req) => {
         await handleCallEnd(callSid, session.startTime);
       }
       activeCalls.delete(callSid);
+      clearDigitTimeout(callSid);
     });
 
     // Send first message once stream is ready
@@ -1299,30 +1506,29 @@ app.ws('/aws/stream', (ws, req) => {
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       const session = await sessionPromise;
+      const otpContext = getOtpContext(text, callSid);
       try {
-        const { sanitized, otpDetected, codes } = sanitizeOtpText(text, callSid);
         await db.addTranscript({
           call_sid: callSid,
           speaker: 'user',
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount
         });
         await db.updateCallState(callSid, 'user_spoke', {
-          message: sanitized,
+          message: otpContext.raw,
           interaction_count: interactionCount,
-          otp_detected: otpDetected,
-          last_collected_code: codes?.slice(-1)[0] || null,
-          collected_codes: codes?.join(', ') || null
+          otp_detected: otpContext.otpDetected,
+          last_collected_code: otpContext.codes?.slice(-1)[0] || null,
+          collected_codes: otpContext.codes?.join(', ') || null
         });
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
 
-      const { sanitized, codes } = sanitizeOtpText(text, callSid);
-      webhookService.recordTranscriptTurn(callSid, 'user', sanitized);
-      if (codes && codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, codes[codes.length - 1]);
+      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+      if (otpContext.codes && otpContext.codes.length) {
+        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
         if (collection.accepted && collection.route) {
           webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
@@ -1330,13 +1536,13 @@ app.ws('/aws/stream', (ws, req) => {
         await handleCollectionResult(callSid, collection, session.gptService, interactionCount);
       }
 
-      if (shouldCloseConversation(sanitized) && interactionCount >= 1) {
+      if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
         session.gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
         session.gptService.setPhase('closing');
       }
 
       try {
-        await session.gptService.completion(sanitized, interactionCount);
+        await session.gptService.completion(otpContext.maskedForGpt, interactionCount);
       } catch (gptError) {
         console.error('GPT completion error:', gptError);
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
@@ -1382,8 +1588,13 @@ async function handleCallEnd(callSid, callStartTime) {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
     digitCollectionManager.expectations.delete(callSid);
+    clearDigitTimeout(callSid);
 
     const transcripts = await db.getCallTranscripts(callSid);
+    const maskedTranscripts = transcripts.map((entry) => ({
+      ...entry,
+      message: maskOtpForExternal(entry.message)
+    }));
     const summary = generateCallSummary(transcripts, duration);
     
     // Get personality adaptation data
@@ -1488,6 +1699,7 @@ function generateCallSummary(transcripts, duration) {
 // Incoming endpoint used by Twilio to connect the call to our websocket stream
 app.post('/incoming', (req, res) => {
   try {
+    warnOnInvalidTwilioSignature(req, '/incoming');
     if (!config.server?.hostname) {
       return res.status(500).send('Server hostname not configured');
     }
@@ -2116,10 +2328,7 @@ app.post('/webhook/call-status', async (req, res) => {
       ErrorMessage,
       DialCallDuration // This is key for detecting actual answer vs no-answer
     } = req.body;
-    if (!validateTwilioRequest(req)) {
-      console.warn(`⚠️ Rejected call status webhook for ${CallSid || 'unknown'} due to invalid Twilio signature`);
-      return res.status(401).send('Unauthorized');
-    }
+    warnOnInvalidTwilioSignature(req, '/webhook/call-status');
 
     console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
     console.log(`Debug Info:`);
@@ -2352,8 +2561,8 @@ app.get('/api/calls/:callSid', async (req, res) => {
     
     res.json({
       call,
-      transcripts,
-      transcript_count: transcripts.length,
+      transcripts: maskedTranscripts,
+      transcript_count: maskedTranscripts.length,
       adaptation_analytics: adaptationData,
       business_context: call.business_context ? JSON.parse(call.business_context) : null,
       webhook_notifications: webhookNotifications,
@@ -3139,8 +3348,8 @@ app.get('/api/calls/search', async (req, res) => {
       transcript_count: call.transcript_count || 0,
       call_summary: call.call_summary,
       // Highlight matching text (basic implementation)
-      matching_text: call.conversation_text ? 
-        call.conversation_text.substring(0, 200) + '...' : null,
+      matching_text: call.conversation_text ?
+        `${maskOtpForExternal(call.conversation_text).substring(0, 200)}...` : null,
       created_date: new Date(call.created_at).toLocaleDateString(),
       duration_formatted: call.duration ? 
         `${Math.floor(call.duration/60)}:${String(call.duration%60).padStart(2,'0')}` : 'N/A'
@@ -3167,6 +3376,7 @@ app.get('/api/calls/search', async (req, res) => {
 // SMS webhook endpoints
 app.post('/webhook/sms', async (req, res) => {
     try {
+        warnOnInvalidTwilioSignature(req, '/webhook/sms');
         const { From, Body, MessageSid, SmsStatus } = req.body;
 
         console.log(`SMS webhook: ${From} -> ${Body}`);
@@ -3196,6 +3406,7 @@ app.post('/webhook/sms', async (req, res) => {
 
 app.post('/webhook/sms-status', async (req, res) => {
     try {
+        warnOnInvalidTwilioSignature(req, '/webhook/sms-status');
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
 
         console.log(`SMS status update: ${MessageSid} -> ${MessageStatus}`);

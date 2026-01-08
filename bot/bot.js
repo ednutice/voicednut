@@ -17,6 +17,21 @@ try {
 const { conversations, createConversation } = conversationsPkg;
 const axios = require('axios');
 const config = require('./config');
+const { attachHmacAuth } = require('./utils/apiAuth');
+
+const apiOrigins = new Set();
+try {
+    apiOrigins.add(new URL(config.apiUrl).origin);
+} catch (_) {}
+try {
+    apiOrigins.add(new URL(config.templatesApiUrl).origin);
+} catch (_) {}
+
+attachHmacAuth(axios, {
+    secret: config.apiAuth?.hmacSecret,
+    allowedOrigins: apiOrigins,
+    defaultBaseUrl: config.apiUrl
+});
 const {
     initialSessionState,
     ensureSession,

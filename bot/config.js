@@ -5,7 +5,7 @@
  */
 
 require('dotenv').config();
-const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN', 'ADMIN_API_TOKEN'];
+const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN', 'ADMIN_API_TOKEN', 'API_HMAC_SECRET'];
 
 const missing = required.filter((key) => !process.env[key]);
 if (missing.length > 0) {
@@ -39,4 +39,7 @@ module.exports = {
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',
+  apiAuth: {
+    hmacSecret: process.env.API_HMAC_SECRET,
+  },
 };

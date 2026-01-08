@@ -20,6 +20,13 @@ const SECTIONS = [
     ],
   },
   {
+    comments: ['# API request signing (shared with bot)'],
+    fields: [
+      { key: 'API_HMAC_SECRET', prompt: 'API HMAC Secret', defaultValue: 'change-me' },
+      { key: 'API_HMAC_MAX_SKEW_MS', prompt: 'API HMAC max skew (ms)', defaultValue: '300000' },
+    ],
+  },
+  {
     comments: ['# Twilio credentials (required when CALL_PROVIDER=twilio)'],
     fields: [
       { key: 'TWILIO_ACCOUNT_SID', prompt: 'Twilio Account SID' },

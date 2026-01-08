@@ -20,6 +20,7 @@ const {
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
 const { section, buildLine, tipLine } = require('../utils/messageStyle');
+const { attachHmacAuth } = require('../utils/apiAuth');
 
 const templatesApi = axios.create({
   baseURL: config.templatesApiUrl.replace(/\/+$/, ''),
@@ -28,6 +29,12 @@ const templatesApi = axios.create({
     'Content-Type': 'application/json',
     'x-admin-token': config.admin.apiToken
   }
+});
+
+attachHmacAuth(templatesApi, {
+  secret: config.apiAuth?.hmacSecret,
+  allowedOrigins: [new URL(config.templatesApiUrl).origin],
+  defaultBaseUrl: config.templatesApiUrl
 });
 
 function styledNotice(ctx, title, lines) {

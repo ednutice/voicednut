@@ -26,6 +26,12 @@ const SECTIONS = [
       { key: 'ADMIN_API_TOKEN', prompt: 'Admin API Token', defaultValue: 'change-me' },
     ],
   },
+  {
+    comments: ['# API request signing (must match API_HMAC_SECRET)'],
+    fields: [
+      { key: 'API_HMAC_SECRET', prompt: 'API HMAC Secret', defaultValue: 'change-me' },
+    ],
+  },
 ];
 
 async function confirmOverwrite(targetPath) {

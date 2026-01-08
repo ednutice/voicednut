@@ -52,6 +52,15 @@ if (!allowedComplianceModes.has(complianceModeRaw) && !isProduction) {
   console.warn(`Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`);
 }
 const dtmfEncryptionKey = readEnv('DTMF_ENCRYPTION_KEY');
+const apiHmacSecret = readEnv('API_HMAC_SECRET');
+const apiHmacMaxSkewMs = Number(readEnv('API_HMAC_MAX_SKEW_MS') || '300000');
+if (!apiHmacSecret) {
+  const message = 'Missing required environment variable "API_HMAC_SECRET".';
+  if (isProduction) {
+    throw new Error(message);
+  }
+  console.warn(`${message} HMAC auth will be disabled.`);
+}
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
@@ -166,5 +175,9 @@ module.exports = {
   },
   smsDefaults: {
     businessId: defaultSmsBusinessId,
+  },
+  apiAuth: {
+    hmacSecret: apiHmacSecret,
+    maxSkewMs: apiHmacMaxSkewMs,
   },
 };

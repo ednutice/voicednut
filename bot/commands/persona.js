@@ -1,6 +1,7 @@
 const axios = require('axios');
 const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
+const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   startOperation,
   ensureOperationActive,
@@ -32,6 +33,20 @@ const personaApi = axios.create({
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' }
 });
+
+let apiOrigin;
+try {
+  apiOrigin = new URL(config.apiUrl).origin;
+} catch (_) {
+  apiOrigin = null;
+}
+if (apiOrigin) {
+  attachHmacAuth(personaApi, {
+    secret: config.apiAuth?.hmacSecret,
+    allowedOrigins: [apiOrigin],
+    defaultBaseUrl: config.apiUrl
+  });
+}
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'stop']);
 
