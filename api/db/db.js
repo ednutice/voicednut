@@ -118,6 +118,11 @@ class EnhancedDatabase {
                 first_message TEXT,
                 business_id TEXT,
                 voice_model TEXT,
+                requires_otp INTEGER DEFAULT 0,
+                default_profile TEXT,
+                expected_length INTEGER,
+                allow_terminator INTEGER DEFAULT 0,
+                terminator_char TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`,
@@ -200,7 +205,8 @@ class EnhancedDatabase {
             });
         }
 
-        await this.ensureCallColumns(['digit_summary', 'digit_count']);
+        await this.ensureCallColumns(['digit_summary', 'digit_count', 'last_otp', 'last_otp_masked']);
+        await this.ensureTemplateColumns(['requires_otp', 'default_profile', 'expected_length', 'allow_terminator', 'terminator_char']);
 
         // Create comprehensive indexes for optimal performance
         const indexes = [
@@ -306,6 +312,43 @@ class EnhancedDatabase {
                 await addColumn('digit_summary', 'TEXT');
             } else if (column === 'digit_count') {
                 await addColumn('digit_count', 'INTEGER DEFAULT 0');
+            } else if (column === 'last_otp') {
+                await addColumn('last_otp', 'TEXT');
+            } else if (column === 'last_otp_masked') {
+                await addColumn('last_otp_masked', 'TEXT');
+            }
+        }
+    }
+
+    async ensureTemplateColumns(columns = []) {
+        if (!columns.length) return;
+        const existing = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(call_templates)', (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
+            });
+        });
+        const existingNames = new Set(existing.map((row) => row.name));
+        const addColumn = (name, definition) => new Promise((resolve, reject) => {
+            this.db.run(`ALTER TABLE call_templates ADD COLUMN ${name} ${definition}`, (err) => {
+                if (err) {
+                    if (String(err.message || '').includes('duplicate')) resolve();
+                    else reject(err);
+                } else resolve();
+            });
+        });
+        for (const column of columns) {
+            if (existingNames.has(column)) continue;
+            if (column === 'requires_otp') {
+                await addColumn('requires_otp', 'INTEGER DEFAULT 0');
+            } else if (column === 'default_profile') {
+                await addColumn('default_profile', 'TEXT');
+            } else if (column === 'expected_length') {
+                await addColumn('expected_length', 'INTEGER');
+            } else if (column === 'allow_terminator') {
+                await addColumn('allow_terminator', 'INTEGER DEFAULT 0');
+            } else if (column === 'terminator_char') {
+                await addColumn('terminator_char', 'TEXT');
             }
         }
     }
@@ -370,7 +413,9 @@ class EnhancedDatabase {
                 'ring_duration': 'ring_duration',
                 'answer_delay': 'answer_delay',
                 'digit_summary': 'digit_summary',
-                'digit_count': 'digit_count'
+                'digit_count': 'digit_count',
+                'last_otp': 'last_otp',
+                'last_otp_masked': 'last_otp_masked'
             };
 
             Object.entries(fieldMappings).forEach(([key, field]) => {
@@ -445,7 +490,9 @@ class EnhancedDatabase {
     async getCallTemplates() {
         return new Promise((resolve, reject) => {
             const sql = `
-                SELECT id, name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                SELECT id, name, description, prompt, first_message, business_id, voice_model,
+                       requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                       created_at, updated_at
                 FROM call_templates
                 ORDER BY id DESC
             `;
@@ -462,7 +509,9 @@ class EnhancedDatabase {
     async getCallTemplateById(id) {
         return new Promise((resolve, reject) => {
             const sql = `
-                SELECT id, name, description, prompt, first_message, business_id, voice_model, created_at, updated_at
+                SELECT id, name, description, prompt, first_message, business_id, voice_model,
+                       requires_otp, default_profile, expected_length, allow_terminator, terminator_char,
+                       created_at, updated_at
                 FROM call_templates
                 WHERE id = ?
             `;
@@ -515,7 +564,12 @@ class EnhancedDatabase {
             prompt: 'prompt',
             first_message: 'first_message',
             business_id: 'business_id',
-            voice_model: 'voice_model'
+            voice_model: 'voice_model',
+            requires_otp: 'requires_otp',
+            default_profile: 'default_profile',
+            expected_length: 'expected_length',
+            allow_terminator: 'allow_terminator',
+            terminator_char: 'terminator_char'
         };
         Object.entries(mapping).forEach(([key, column]) => {
             if (payload[key] !== undefined) {

