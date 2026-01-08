@@ -106,6 +106,32 @@ class EnhancedGptService extends EventEmitter {
     }
   }
 
+  getSanitizedTools() {
+    if (!Array.isArray(this.dynamicTools) || this.dynamicTools.length === 0) {
+      return [];
+    }
+
+    const sanitized = [];
+    for (const tool of this.dynamicTools) {
+      if (!tool || tool.type !== 'function' || !tool.function) {
+        continue;
+      }
+      const { name, description, parameters } = tool.function;
+      if (!name) {
+        continue;
+      }
+      sanitized.push({
+        type: 'function',
+        function: {
+          name,
+          description,
+          parameters
+        }
+      });
+    }
+    return sanitized;
+  }
+
   composeSystemPrompt(basePrompt = null) {
     const personalityBlock = basePrompt || this.personalityPrompt || this.baseSystemPrompt;
     return [
@@ -202,9 +228,14 @@ class EnhancedGptService extends EventEmitter {
   }
 
   updateUserContext(name, role, text) {
-    const entry = name !== 'user'
-      ? { role, name, content: text }
-      : { role, content: text };
+    let entry;
+    if (role === 'tool') {
+      entry = { role: 'tool', content: text, tool_call_id: name };
+    } else if (name !== 'user') {
+      entry = { role, name, content: text };
+    } else {
+      entry = { role, content: text };
+    }
 
     this.userContext.push(entry);
     this.addToPhaseWindow(entry);
@@ -275,8 +306,8 @@ class EnhancedGptService extends EventEmitter {
 
     this.updateUserContext(name, role, text);
 
-    // Use dynamic tools if available, otherwise use default empty array
-    const toolsToUse = this.dynamicTools.length > 0 ? this.dynamicTools : [];
+    // Use sanitized tools for the model (strip custom fields like "say"/"returns")
+    const toolsToUse = this.getSanitizedTools();
     const adaptiveMaxTokens = this.getAdaptiveMaxTokens();
     const messages = this.buildModelMessages();
 
@@ -369,6 +400,7 @@ class EnhancedGptService extends EventEmitter {
     let partialResponse = '';
     let functionName = '';
     let functionArgs = '';
+    let functionCallId = '';
     let finishReason = '';
     let streamError = null;
 
@@ -376,6 +408,10 @@ class EnhancedGptService extends EventEmitter {
       let name = deltas.tool_calls[0]?.function?.name || '';
       if (name != '') {
         functionName = name;
+      }
+      const callId = deltas.tool_calls[0]?.id;
+      if (callId) {
+        functionCallId = callId;
       }
       let args = deltas.tool_calls[0]?.function?.arguments || '';
       if (args != '') {
@@ -430,10 +466,19 @@ class EnhancedGptService extends EventEmitter {
             functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
           }
 
-          this.updateUserContext(functionName, 'function', functionResponse);
+          const responseText = typeof functionResponse === 'string'
+            ? functionResponse
+            : JSON.stringify(functionResponse);
+          const toolRole = functionCallId ? 'tool' : 'function';
+          const toolName = functionCallId || functionName;
+
+          // For digit collection, wait for user input instead of continuing immediately
+          if (functionName === 'collect_digits') {
+            return;
+          }
 
           // Continue completion with function response
-          await this.completion(functionResponse, interactionCount, 'function', functionName);
+          await this.completion(responseText, interactionCount, toolRole, toolName);
         } else {
           completeResponse += content;
           partialResponse += content;

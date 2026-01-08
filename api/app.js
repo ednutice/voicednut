@@ -318,15 +318,15 @@ const digitCollectionManager = {
     exp.collected.push(result.digits);
     exp.last_masked = masked;
 
-    if (!result.accepted && result.reason !== 'incomplete') {
+    if (result.accepted) {
+      // reset buffer after successful collection
+      exp.buffer = '';
+    } else if (result.reason !== 'incomplete') {
       exp.retries += 1;
       result.retries = exp.retries;
       if (exp.retries > exp.max_retries) {
         result.fallback = true;
       }
-    } else {
-      // reset buffer after successful collection
-      exp.buffer = '';
     }
 
     this.expectations.set(callSid, exp);
@@ -358,6 +358,11 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
     });
   } catch (err) {
     console.error('Error logging digits_collected:', err);
+  }
+
+  if (!collection.accepted && collection.reason === 'incomplete') {
+    scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+    return;
   }
 
   const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
@@ -628,6 +633,76 @@ function buildRecapSmsBody(call) {
 }
 
 const OTP_REGEX = /\b\d{4,8}\b/g;
+const DIGIT_WORD_MAP = {
+  zero: '0',
+  oh: '0',
+  o: '0',
+  one: '1',
+  two: '2',
+  three: '3',
+  four: '4',
+  five: '5',
+  six: '6',
+  seven: '7',
+  eight: '8',
+  nine: '9'
+};
+const SPOKEN_DIGIT_PATTERN = new RegExp(
+  `\\b(?:${Object.keys(DIGIT_WORD_MAP).join('|')})(?:\\s+(?:${Object.keys(DIGIT_WORD_MAP).join('|')})){3,}\\b`,
+  'gi'
+);
+
+function extractSpokenDigitSequences(text = '') {
+  if (!text) return [];
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const sequences = [];
+  let buffer = '';
+  let repeat = 1;
+
+  for (const token of tokens) {
+    if (token === 'double') {
+      repeat = 2;
+      continue;
+    }
+    if (token === 'triple') {
+      repeat = 3;
+      continue;
+    }
+
+    if (DIGIT_WORD_MAP[token]) {
+      buffer += DIGIT_WORD_MAP[token].repeat(repeat);
+      repeat = 1;
+      continue;
+    }
+
+    if (/^\d+$/.test(token)) {
+      if (buffer) {
+        sequences.push(buffer);
+        buffer = '';
+      }
+      sequences.push(token);
+      repeat = 1;
+      continue;
+    }
+
+    if (buffer) {
+      sequences.push(buffer);
+      buffer = '';
+    }
+    repeat = 1;
+  }
+
+  if (buffer) {
+    sequences.push(buffer);
+  }
+
+  return sequences;
+}
 
 function getOtpContext(text = '', callSid = null) {
   if (!text) {
@@ -641,9 +716,11 @@ function getOtpContext(text = '', callSid = null) {
   }
   const expectation = callSid ? digitCollectionManager.expectations.get(callSid) : null;
   const maskForGpt = expectation ? expectation.mask_for_gpt !== false : true;
-  const codes = [...text.matchAll(OTP_REGEX)].map((m) => m[0]);
+  const numericCodes = [...text.matchAll(OTP_REGEX)].map((m) => m[0]);
+  const spokenCodes = extractSpokenDigitSequences(text).filter((code) => code.length >= 4 && code.length <= 8);
+  const codes = [...numericCodes, ...spokenCodes];
   const otpDetected = codes.length > 0;
-  const masked = text.replace(OTP_REGEX, '******');
+  const masked = text.replace(OTP_REGEX, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
   return {
     raw: text,
     maskedForGpt: maskForGpt ? masked : text,
@@ -655,7 +732,7 @@ function getOtpContext(text = '', callSid = null) {
 
 function maskOtpForExternal(text = '') {
   if (!text) return text;
-  return text.replace(OTP_REGEX, '******');
+  return text.replace(OTP_REGEX, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
 }
 
 function shouldCloseConversation(text = '') {
@@ -1159,6 +1236,10 @@ app.ws('/connection', (ws) => {
           if (digits) {
             webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
             const collection = digitCollectionManager.recordDigits(callSid, digits);
+            if (collection?.reason === 'incomplete') {
+              scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+              return;
+            }
             await handleCollectionResult(callSid, collection, gptService, interactionCount);
             if (collection.accepted && collection.route) {
               webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
