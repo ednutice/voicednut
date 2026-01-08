@@ -408,6 +408,7 @@ const digitFallbackStates = new Map();
 const digitCollectionPlans = new Map();
 const callEndLocks = new Map();
 const silenceTimers = new Map();
+const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
 
 const DEFAULT_COLLECT_DELAY_MS = 1200;
 
@@ -1698,6 +1699,10 @@ app.ws('/connection', (ws, req) => {
           streamSid = msg.start.streamSid;
           callSid = msg.start.callSid;
           callStartTime = new Date();
+          if (pendingStreams.has(callSid)) {
+            clearTimeout(pendingStreams.get(callSid));
+            pendingStreams.delete(callSid);
+          }
           
           console.log(`Adaptive call started - SID: ${callSid}`);
           
@@ -2551,6 +2556,16 @@ app.post('/incoming', (req, res) => {
       return res.status(500).send('Server hostname not configured');
     }
     console.log(`Incoming call webhook from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'}`);
+    const callSid = req.body?.CallSid;
+    if (callSid) {
+      const timeout = setTimeout(() => {
+        if (!activeCalls.has(callSid)) {
+          console.warn(`WebSocket not established for CallSid ${callSid} within 5s of /incoming. Check WSS reachability to ${host}.`);
+        }
+        pendingStreams.delete(callSid);
+      }, 5000);
+      pendingStreams.set(callSid, timeout);
+    }
     const response = new VoiceResponse();
     const connect = response.connect();
     // Request both audio + DTMF events from Twilio Media Streams
