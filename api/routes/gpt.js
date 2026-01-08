@@ -434,17 +434,35 @@ class EnhancedGptService extends EventEmitter {
         }
 
         if (finishReason === 'tool_calls') {
-          // Use dynamic function if available
-          const functionToCall = this.availableFunctions[functionName];
-
-          if (!functionToCall) {
-          console.error(`❌ Function ${functionName} not found in dynamic implementations`.red);
-            // Continue without function call
-            completeResponse += `I apologize, but I cannot execute the ${functionName} function at this time.`;
+          if (!functionName) {
+            console.error('❌ Tool call requested without a function name.'.red);
             continue;
           }
 
+          const functionToCall = this.availableFunctions[functionName];
           const validatedArgs = this.validateFunctionArgs(functionArgs);
+          const toolCallId = functionCallId || `tool_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+          const toolArgs = functionArgs && String(functionArgs).trim().length > 0
+            ? String(functionArgs)
+            : JSON.stringify(validatedArgs || {});
+
+          // Record the assistant tool call so the next tool message is valid
+          const toolCallMessage = {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: toolCallId,
+                type: 'function',
+                function: {
+                  name: functionName,
+                  arguments: toolArgs
+                }
+              }
+            ]
+          };
+          this.userContext.push(toolCallMessage);
+          this.addToPhaseWindow(toolCallMessage);
 
           // Find the corresponding tool data for the "say" message
           const toolData = this.dynamicTools.find(tool => tool.function.name === functionName);
@@ -459,26 +477,28 @@ class EnhancedGptService extends EventEmitter {
 
           let functionResponse;
           try {
+            if (!functionToCall) {
+              throw new Error(`Function ${functionName} not available`);
+            }
             functionResponse = await functionToCall(validatedArgs);
             console.log(`🔧 Executed dynamic function: ${functionName}`.green);
           } catch (functionError) {
-          console.error(`❌ Error executing function ${functionName}:`, functionError);
+            console.error(`❌ Error executing function ${functionName}:`, functionError);
             functionResponse = JSON.stringify({ error: 'Function execution failed', details: functionError.message });
           }
 
           const responseText = typeof functionResponse === 'string'
             ? functionResponse
             : JSON.stringify(functionResponse);
-          const toolRole = functionCallId ? 'tool' : 'function';
-          const toolName = functionCallId || functionName;
 
           // For digit collection, wait for user input instead of continuing immediately
           if (functionName === 'collect_digits') {
+            this.updateUserContext(toolCallId, 'tool', responseText);
             return;
           }
 
           // Continue completion with function response
-          await this.completion(responseText, interactionCount, toolRole, toolName);
+          await this.completion(responseText, interactionCount, 'tool', toolCallId);
         } else {
           completeResponse += content;
           partialResponse += content;

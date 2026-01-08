@@ -41,6 +41,7 @@ const recordingEnabled = String(readEnv('RECORDING_ENABLED') || 'false').toLower
 const transferNumber = readEnv('TRANSFER_NUMBER');
 const defaultSmsBusinessId = readEnv('DEFAULT_SMS_BUSINESS_ID') || null;
 const deepgramModel = readEnv('DEEPGRAM_MODEL') || 'nova-2';
+const twilioGatherFallback = String(readEnv('TWILIO_GATHER_FALLBACK') || 'true').toLowerCase() === 'true';
 
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
@@ -94,6 +95,7 @@ module.exports = {
     authToken: ensure('TWILIO_AUTH_TOKEN'),
     fromNumber: ensure('FROM_NUMBER'),
     transferNumber,
+    gatherFallback: twilioGatherFallback,
   },
   aws: {
     region: awsRegion,

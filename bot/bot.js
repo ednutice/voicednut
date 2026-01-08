@@ -243,6 +243,76 @@ function formatDuration(seconds = 0) {
     return `${minutes}:${String(remaining).padStart(2, '0')}`;
 }
 
+function splitMessageIntoChunks(message = '', limit = 3500) {
+    const lines = String(message || '').split('\n');
+    const chunks = [];
+    let buffer = '';
+    for (const line of lines) {
+        const next = buffer ? `${buffer}\n${line}` : line;
+        if (next.length > limit && buffer) {
+            chunks.push(buffer);
+            buffer = line;
+        } else {
+            buffer = next;
+        }
+    }
+    if (buffer) {
+        chunks.push(buffer);
+    }
+    return chunks;
+}
+
+async function sendFullTranscriptFromApi(ctx, callSid) {
+    if (!callSid) {
+        await ctx.reply('❌ Missing call identifier for transcript.');
+        return;
+    }
+
+    let callData;
+    let transcripts = [];
+
+    try {
+        const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+        callData = response.data?.call || response.data;
+        transcripts = response.data?.transcripts || [];
+    } catch (error) {
+        console.error('Full transcript fetch error:', error?.message || error);
+        await ctx.reply('❌ Unable to retrieve full transcript. Please try again later.');
+        return;
+    }
+
+    if (!callData || !transcripts || transcripts.length === 0) {
+        await ctx.reply('📋 No transcript available for this call yet.');
+        return;
+    }
+
+    const duration = callData.duration ? formatDuration(callData.duration) : 'N/A';
+    const startTime = callData.started_at ? new Date(callData.started_at).toLocaleString() : 'Unknown';
+    const digitSummary = callData.digit_summary ? escapeHtml(callData.digit_summary) : '';
+
+    let message = `📄 <b>Full Transcript</b>\n\n`;
+    message += `📞 <b>Phone:</b> ${escapeHtml(callData.phone_number || 'Unknown')}\n`;
+    message += `⏱️ <b>Duration:</b> ${escapeHtml(duration)}\n`;
+    message += `🕐 <b>Time:</b> ${escapeHtml(startTime)}\n`;
+    message += `💬 <b>Messages:</b> ${escapeHtml(String(transcripts.length))}\n`;
+    if (digitSummary) {
+        message += `🔢 <b>Digits:</b> ${digitSummary}\n`;
+    }
+    message += `\n<b>Conversation:</b>\n`;
+    message += `${'─'.repeat(25)}\n`;
+
+    for (const entry of transcripts) {
+        const speaker = entry.speaker === 'user' ? '🧑 User' : '🤖 AI';
+        const cleanMessage = escapeHtml(entry.message || '');
+        message += `<b>${speaker}:</b> ${cleanMessage}\n\n`;
+    }
+
+    const chunks = splitMessageIntoChunks(message, 3500);
+    for (let i = 0; i < chunks.length; i += 1) {
+        await ctx.reply(chunks[i], { parse_mode: 'HTML' });
+    }
+}
+
 async function handleCallFollowUp(ctx, callSid, followAction) {
     if (!callSid) {
         await ctx.reply('❌ Missing call identifier for follow-up.');
@@ -343,26 +413,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
         }
 
         case 'transcript': {
-            if (!transcripts.length) {
-                await ctx.reply('📋 No transcript is available for this call yet.');
-                return;
-            }
-
-            const maxMessages = 6;
-            let transcriptMessage = `📋 *Recent Transcript*\n\n`;
-            transcripts.slice(0, maxMessages).forEach((entry) => {
-                const speaker = entry.speaker === 'user' ? '👤 Customer' : '🤖 AI';
-                const snippet = escapeMarkdown(entry.message.slice(0, 160));
-                transcriptMessage += `${speaker}: ${snippet}${entry.message.length > 160 ? '…' : ''}\n\n`;
-            });
-
-            if (transcripts.length > maxMessages) {
-                transcriptMessage += `_… ${transcripts.length - maxMessages} more messages_\n\n`;
-            }
-
-            transcriptMessage += `Use /search ${escapeMarkdown(callSid)} for full details.`;
-
-            await ctx.reply(transcriptMessage, { parse_mode: 'Markdown' });
+            await sendFullTranscriptFromApi(ctx, callSid);
             break;
         }
         case 'callagain': {
@@ -605,6 +656,60 @@ bot.on('callback_query:data', async (ctx) => {
             }
             await ctx.reply(detailsMessage);
             return;
+        }
+
+        if (action.startsWith('tr:')) {
+            const callSid = action.split(':')[1];
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            await sendFullTranscriptFromApi(ctx, callSid);
+            return;
+        }
+
+        if (action.startsWith('rca:')) {
+            const callSid = action.split(':')[1];
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            await ctx.reply('🎧 Recording link is not available yet. Sending full transcript instead...');
+            await sendFullTranscriptFromApi(ctx, callSid);
+            return;
+        }
+
+        if (action.startsWith('recap:')) {
+            const [, recapAction, callSid] = action.split(':');
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            if (recapAction === 'skip') {
+                await ctx.reply('👍 Skipping recap for now.');
+                return;
+            }
+            if (recapAction === 'sms') {
+                await ctx.reply('📩 Sending recap via SMS...');
+                try {
+                    const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+                    const callData = response.data?.call || response.data;
+                    if (!callData?.phone_number) {
+                        await ctx.reply('❌ Unable to send recap: phone number missing.');
+                        return;
+                    }
+                    const status = (callData.status || callData.twilio_status || 'completed').replace(/_/g, ' ');
+                    const duration = callData.duration ? ` Duration: ${formatDuration(callData.duration)}.` : '';
+                    const summaryRaw = (callData.call_summary || '').replace(/\s+/g, ' ').trim();
+                    const summary = summaryRaw ? summaryRaw.slice(0, 180) : 'Call finished.';
+                    const name = callData.customer_name ? ` with ${callData.customer_name}` : '';
+                    const message = `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
+                    await axios.post(`${config.apiUrl}/api/sms/send`, {
+                        to: callData.phone_number,
+                        message,
+                        user_chat_id: ctx.from.id
+                    }, { timeout: 15000 });
+                    await ctx.reply('✅ Recap SMS sent.');
+                } catch (error) {
+                    console.error('Recap SMS error:', error?.message || error);
+                    await ctx.reply('❌ Failed to send recap SMS. Please try again later.');
+                }
+                return;
+            }
         }
 
         if (action.startsWith('FOLLOWUP_CALL:')) {

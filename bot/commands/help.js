@@ -10,48 +10,50 @@ module.exports = (bot) => {
             const isAuthorized = Boolean(user);
             const isOwner = isAuthorized ? await new Promise(r => isAdmin(ctx.from.id, r)) : false;
 
-            const callList = [
+            const escapeList = (items) => items.map((item) => escapeMarkdown(item));
+
+            const callList = escapeList([
                 '📞 /call — launch a fresh voice session (requires access)',
                 '🔍 /search <term> — locate calls by number, intent, or ID',
                 '🕒 /recent [limit] — list recent calls (max 50)',
                 '⏱️ /latency <callSid> — see STT/GPT/TTS timing',
                 '🧭 /version — view API/service version info'
-            ];
+            ]);
 
-            const smsList = [
+            const smsList = escapeList([
                 '💬 /sms — send a quick AI-powered SMS (requires access)',
                 '📅 /schedulesms — schedule an SMS in the future (requires access)',
                 '🧾 /smsconversation <phone> — view recent SMS threads (admin)',
                 '🔎 /smsstatus <message_sid> — delivery status for a message (requires access)'
-            ];
+            ]);
 
-            const infoList = [
+            const infoList = escapeList([
                 '🩺 /health or /ping — check bot & API health',
                 '📰 /digest — 24h notifications + recent calls digest',
                 '📚 /guide — view the master user guide (access required)',
                 '📋 /menu — reopen quick actions (access required)',
                 '❓ /help — show this message again'
-            ];
+            ]);
 
-            const quickUsage = [
+            const quickUsage = escapeList([
                 'Use /call or the 📞 button to get started',
                 'Enter phone numbers in E.164 format (+1234567890)',
                 'Describe the AI agent personality and first message',
                 'Monitor live updates and ask for transcripts',
                 'End the call with the ✋ Interrupt or ⏹️ End button if needed'
-            ];
+            ]);
 
-            const exampleUsage = [
+            const exampleUsage = escapeList([
                 '+1234567890 (not 123-456-7890)',
                 '/search refund',
                 '/recent 20',
                 '/health'
-            ];
+            ]);
 
-            const supportBlock = [
+            const supportBlock = escapeList([
                 tipLine('🆘', 'Contact admin: @' + escapeMarkdown(config.admin.username)),
                 tipLine('🧭', 'Bot edition: v2.0.0 — secrets aged to perfection')
-            ];
+            ]);
 
             const helpSections = [
                 emphasize('Ready to guide your AI calls with sparkling clarity.'),
@@ -62,7 +64,7 @@ module.exports = (bot) => {
             ];
 
             if (isOwner) {
-                const adminList = [
+                const adminList = escapeList([
                     '🛡️ /adduser — add a trusted operator',
                     '⭐ /promote — elevate a teammate to admin',
                     '❌ /removeuser — cut access cleanly',
@@ -76,7 +78,7 @@ module.exports = (bot) => {
                     '🍃 /persona — sculpt adaptive agents',
                     '🔀 /provider — view or switch voice providers',
                     '🧭 /version — service version snapshot'
-                ];
+                ]);
                 helpSections.push(section('Admin Toolkit', adminList));
             }
 
@@ -86,16 +88,16 @@ module.exports = (bot) => {
             );
 
             const unauthSections = [
-                emphasize('Welcome! Access is required to use most commands.'),
+                emphasize(escapeMarkdown('Welcome! Access is required to use most commands.')),
                 section('What this bot can do', [
-                    '🤖 Run AI-powered voice calls and SMS outreach',
-                    '🧾 Track conversations and delivery status',
-                    '🛡️ Admins manage users, templates, and providers'
+                    escapeMarkdown('🤖 Run AI-powered voice calls and SMS outreach'),
+                    escapeMarkdown('🧾 Track conversations and delivery status'),
+                    escapeMarkdown('🛡️ Admins manage users, templates, and providers')
                 ]),
                 section('Get access', [
-                    tipLine('🆘', `Contact admin: @${escapeMarkdown(config.admin.username)}`),
-                    'Share your Telegram @ and reason to be approved.',
-                    'Once approved, use /start to see your menu.'
+                    escapeMarkdown(tipLine('🆘', `Contact admin: @${escapeMarkdown(config.admin.username)}`)),
+                    escapeMarkdown('Share your Telegram @ and reason to be approved.'),
+                    escapeMarkdown('Once approved, use /start to see your menu.')
                 ])
             ];
 
