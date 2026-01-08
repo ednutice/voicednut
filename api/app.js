@@ -91,6 +91,13 @@ function clearDigitPlan(callSid) {
   }
 }
 
+function markDigitPrompted(callSid) {
+  const expectation = digitCollectionManager.expectations.get(callSid);
+  if (!expectation) return;
+  expectation.prompted_at = Date.now();
+  digitCollectionManager.expectations.set(callSid, expectation);
+}
+
 function clearCallEndLock(callSid) {
   if (callEndLocks.has(callSid)) {
     callEndLocks.delete(callSid);
@@ -173,6 +180,7 @@ async function triggerTwilioGatherFallback(callSid, expectation, options = {}) {
   const client = twilio(accountSid, authToken);
   const twiml = buildTwilioGatherTwiml(callSid, expectation, options);
   await client.calls(callSid).update({ twiml });
+  markDigitPrompted(callSid);
 
   digitFallbackStates.set(callSid, {
     active: true,
@@ -385,14 +393,16 @@ const digitCollectionPlans = new Map();
 const callEndLocks = new Map();
 const silenceTimers = new Map();
 
+const DEFAULT_COLLECT_DELAY_MS = 1200;
+
 const DIGIT_PROFILE_DEFAULTS = {
-  verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, prompt: 'Please enter the verification code using your keypad.' },
-  otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, prompt: 'Please enter the one-time code on your keypad.' },
-  cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
-  card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, confirmation_style: 'last4', prompt: 'Please enter the card number using your keypad.' },
-  card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
-  zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, prompt: 'Please enter the ZIP code using your keypad.' },
-  extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, prompt: 'Enter the extension using your keypad.' }
+  verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, prompt: 'Please enter the verification code using your keypad.' },
+  otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, prompt: 'Please enter the one-time code on your keypad.' },
+  cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
+  card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', prompt: 'Please enter the card number using your keypad.' },
+  card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
+  zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, prompt: 'Please enter the ZIP code using your keypad.' },
+  extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, prompt: 'Enter the extension using your keypad.' }
 };
 
 const CALL_END_MESSAGES = {
@@ -409,7 +419,11 @@ function getDigitProfileDefaults(profile = 'generic') {
 }
 
 function normalizeDigitExpectation(params = {}) {
-  const profile = String(params.profile || 'generic').toLowerCase();
+  const promptHint = String(params.prompt || '').toLowerCase();
+  let profile = String(params.profile || 'generic').toLowerCase();
+  if (profile === 'generic' && promptHint.match(/\b(code|otp|verification|verify|passcode|pin)\b/)) {
+    profile = 'verification';
+  }
   const defaults = getDigitProfileDefaults(profile);
   const minDigits = typeof params.min_digits === 'number'
     ? params.min_digits
@@ -423,6 +437,9 @@ function normalizeDigitExpectation(params = {}) {
   const maxRetries = typeof params.max_retries === 'number'
     ? params.max_retries
     : (typeof defaults.max_retries === 'number' ? defaults.max_retries : 2);
+  const minCollectDelayMs = typeof params.min_collect_delay_ms === 'number'
+    ? params.min_collect_delay_ms
+    : (typeof defaults.min_collect_delay_ms === 'number' ? defaults.min_collect_delay_ms : DEFAULT_COLLECT_DELAY_MS);
   const maskForGpt = typeof params.mask_for_gpt === 'boolean'
     ? params.mask_for_gpt
     : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
@@ -432,13 +449,22 @@ function normalizeDigitExpectation(params = {}) {
     ? params.prompt
     : (defaults.prompt || 'Please enter the digits now.');
 
+  let normalizedMin = minDigits;
+  let normalizedMax = maxDigits < minDigits ? minDigits : maxDigits;
+  if (profile === 'verification' || profile === 'otp') {
+    if (normalizedMin < 4) normalizedMin = 4;
+    if (normalizedMax < normalizedMin) normalizedMax = normalizedMin;
+    if (normalizedMax > 8) normalizedMax = 8;
+  }
+
   return {
     prompt,
     profile,
-    min_digits: minDigits,
-    max_digits: maxDigits < minDigits ? minDigits : maxDigits,
+    min_digits: normalizedMin,
+    max_digits: normalizedMax,
     timeout_s: timeout,
     max_retries: maxRetries,
+    min_collect_delay_ms: minCollectDelayMs,
     menu_options: params.menu_options || [],
     confirmation_style: confirmationStyle,
     allow_spoken_fallback: params.allow_spoken_fallback !== false,
@@ -513,6 +539,7 @@ const digitCollectionManager = {
       plan_id: params.plan_id || null,
       plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
       plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
+      prompted_at: params.prompted_at || null,
       retries: 0,
       buffer: '',
       collected: [],
@@ -828,6 +855,7 @@ async function startNextDigitPlanStep(callSid, plan, gptService = null, interact
     try {
       gptService.updateUserContext('digit_collection_plan', 'system', `Digit plan step ${payload.plan_step_index}/${payload.plan_total_steps} (${payload.profile})`);
     } catch (_) {}
+    markDigitPrompted(callSid);
   }
 }
 
@@ -988,6 +1016,7 @@ function buildTelephonyImplementations(callSid, gptService = null) {
           };
           gptService.emit('gptreply', reply, 0);
           gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits. Prompt: ${payload.prompt}`);
+          markDigitPrompted(callSid);
         }
       } catch (err) {
         console.error('collect_digits handler error:', err);
@@ -1840,6 +1869,16 @@ app.ws('/connection', (ws) => {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || '';
           if (digits) {
             clearSilenceTimer(callSid);
+            const expectation = digitCollectionManager.expectations.get(callSid);
+            if (!expectation) {
+              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored)`, { force: true });
+              return;
+            }
+            const delayMs = expectation.min_collect_delay_ms || DEFAULT_COLLECT_DELAY_MS;
+            if (!expectation.prompted_at || Date.now() - expectation.prompted_at < delayMs) {
+              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored early)`, { force: true });
+              return;
+            }
             webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits}`, { force: true });
             const collection = digitCollectionManager.recordDigits(callSid, digits);
             await handleCollectionResult(callSid, collection, gptService, interactionCount, 'dtmf');

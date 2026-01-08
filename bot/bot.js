@@ -226,7 +226,7 @@ registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
 
 function escapeMarkdown(text = '') {
-    return text.replace(/([_*[\]()~`>#+=|{}.!\\-])/g, '\\$1');
+    return text.replace(/([_*[\]`])/g, '\\$1');
 }
 
 function escapeHtml(text = '') {

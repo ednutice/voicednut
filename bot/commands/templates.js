@@ -143,7 +143,7 @@ function isCancelInput(text) {
 }
 
 function escapeMarkdown(text = '') {
-  return text.replace(/([_*[\]()~`>#+=|{}.!\\])/g, '\\$1');
+  return text.replace(/([_*[\]`])/g, '\\$1');
 }
 
 function replacePlaceholders(text = '', values = {}) {

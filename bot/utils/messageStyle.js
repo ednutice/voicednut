@@ -1,6 +1,7 @@
 const escapeMarkdown = (input = '') => {
     if (typeof input !== 'string') return input;
-    return input.replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
+    // Telegram Markdown (legacy) only needs escaping for a small subset of characters.
+    return input.replace(/([_*[\]`])/g, '\\$1');
 };
 
 const buildLine = (emoji, label, value) => `${emoji} ${label}: ${value}`;
