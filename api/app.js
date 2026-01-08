@@ -137,18 +137,27 @@ function buildDigitPrompt(expectation) {
   return expectation?.prompt || `Please enter the ${label} code using your keypad.`;
 }
 
-function buildTwilioStreamTwiml() {
+function resolveHost(req) {
+  return config.server?.hostname
+    || req?.headers?.['x-forwarded-host']
+    || req?.headers?.host
+    || '';
+}
+
+function buildTwilioStreamTwiml(hostname) {
   const response = new VoiceResponse();
   const connect = response.connect();
-  connect.stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+  const host = hostname || config.server.hostname;
+  connect.stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
   return response.toString();
 }
 
-function buildTwilioGatherTwiml(callSid, expectation, options = {}) {
+function buildTwilioGatherTwiml(callSid, expectation, options = {}, hostname) {
   const response = new VoiceResponse();
   const min = expectation?.min_digits || 1;
   const max = expectation?.max_digits || min;
-  const actionUrl = `https://${config.server.hostname}/webhook/twilio-gather?callSid=${encodeURIComponent(callSid)}`;
+  const host = hostname || config.server.hostname;
+  const actionUrl = `https://${host}/webhook/twilio-gather?callSid=${encodeURIComponent(callSid)}`;
   const gather = response.gather({
     input: 'dtmf',
     numDigits: max,
@@ -327,10 +336,11 @@ function verifyHmacSignature(req) {
 }
 
 function getTwilioWebhookUrl(req) {
-  if (!config.server?.hostname) {
+  const host = resolveHost(req);
+  if (!host) {
     return null;
   }
-  return `https://${config.server.hostname}${req.originalUrl}`;
+  return `https://${host}${req.originalUrl}`;
 }
 
 function validateTwilioRequest(req) {
@@ -2531,14 +2541,15 @@ function generateCallSummary(transcripts, duration) {
 app.post('/incoming', (req, res) => {
   try {
     warnOnInvalidTwilioSignature(req, '/incoming');
-    if (!config.server?.hostname) {
+    const host = resolveHost(req);
+    if (!host) {
       return res.status(500).send('Server hostname not configured');
     }
     console.log(`Incoming call webhook from ${req.body?.From || 'unknown'} to ${req.body?.To || 'unknown'}`);
     const response = new VoiceResponse();
     const connect = response.connect();
     // Request both audio + DTMF events from Twilio Media Streams
-    connect.stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+    connect.stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
 
     res.type('text/xml');
     res.end(response.toString());
@@ -4366,8 +4377,9 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     if (!expectation) {
       console.warn(`Gather webhook had no expectation; reconnecting stream for ${callSid}`);
       const response = new VoiceResponse();
+      const host = resolveHost(req);
       response.say('One moment please.');
-      response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+      response.connect().stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
       res.type('text/xml');
       res.end(response.toString());
       return;
@@ -4382,8 +4394,9 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       if (collection.accepted) {
         const nextExpectation = digitCollectionManager.expectations.get(callSid);
         if (nextExpectation?.plan_id) {
+          const host = resolveHost(req);
           const prompt = `Thanks. ${buildDigitPrompt(nextExpectation)}`;
-          const twiml = buildTwilioGatherTwiml(callSid, nextExpectation, { prompt });
+          const twiml = buildTwilioGatherTwiml(callSid, nextExpectation, { prompt }, host);
           res.type('text/xml');
           res.end(twiml);
           return;
@@ -4391,12 +4404,13 @@ app.post('/webhook/twilio-gather', async (req, res) => {
         // Keep the call alive unless the expectation explicitly asked to end it
         const response = new VoiceResponse();
         const shouldEnd = expectation?.end_call_on_success === true;
+        const host = resolveHost(req);
         if (shouldEnd) {
           response.say(CALL_END_MESSAGES.success);
           response.hangup();
         } else {
           response.say('Thanks, continuing.');
-          response.connect().stream({ url: `wss://${config.server.hostname}/connection`, track: 'both_tracks' });
+          response.connect().stream({ url: `wss://${host}/connection`, track: 'both_tracks' });
         }
         clearDigitFallbackState(callSid);
         res.type('text/xml');
@@ -4432,9 +4446,10 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       return;
     }
 
+    const host = resolveHost(req);
     const twiml = buildTwilioGatherTwiml(callSid, expectation, {
       prompt: 'I did not receive any input. Please enter the code using your keypad.'
-    });
+    }, host);
     res.type('text/xml');
     res.end(twiml);
   } catch (error) {
