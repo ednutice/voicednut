@@ -624,6 +624,24 @@ const digitCollectionManager = {
     const result = { profile: exp.profile, mask_for_gpt: exp.mask_for_gpt };
     const hasTerminator = exp.allow_terminator && digits.includes(exp.terminator_char || '#');
     const cleanDigits = digits.replace(/[^0-9]/g, '');
+    const isRepeating = (val) => val.length >= 6 && /^([0-9])\1+$/.test(val);
+    const isAscending = (val) => val.length >= 6 && '0123456789'.includes(val);
+
+    // Inter-key gap heuristic for DTMF spam
+    if (meta.timestamp && exp.profile !== 'menu') {
+      const lastTs = lastDtmfTimestamps.get(callSid) || 0;
+      const gap = lastTs ? meta.timestamp - lastTs : null;
+      if (gap !== null && gap < MIN_DTMF_GAP_MS && cleanDigits.length === 1) {
+        result.accepted = false;
+        result.reason = 'too_fast';
+        result.heuristic = 'inter_key_gap';
+        exp.buffer = '';
+        this.expectations.set(callSid, exp);
+        lastDtmfTimestamps.set(callSid, meta.timestamp);
+        return result;
+      }
+      lastDtmfTimestamps.set(callSid, meta.timestamp);
+    }
 
     if (exp.profile === 'menu' && exp.menu_options.length) {
       const hit = exp.menu_options.find((o) => String(o.digit) === String(cleanDigits || digits));
@@ -6046,22 +6064,3 @@ process.on('SIGTERM', async () => {
   
   process.exit(0);
 });
-    // Inter-key gap heuristic for DTMF spam
-    if (meta.timestamp && exp.profile !== 'menu') {
-      const lastTs = lastDtmfTimestamps.get(callSid) || 0;
-      const gap = lastTs ? meta.timestamp - lastTs : null;
-      if (gap !== null && gap < MIN_DTMF_GAP_MS && cleanDigits.length === 1) {
-        result.accepted = false;
-        result.reason = 'too_fast';
-        result.heuristic = 'inter_key_gap';
-        exp.buffer = '';
-        this.expectations.set(callSid, exp);
-        lastDtmfTimestamps.set(callSid, meta.timestamp);
-        return result;
-      }
-      lastDtmfTimestamps.set(callSid, meta.timestamp);
-    }
-
-    // Pattern heuristics (repeating/ascending) for long codes
-    const isRepeating = (val) => val.length >= 6 && /^([0-9])\1+$/.test(val);
-    const isAscending = (val) => val.length >= 6 && '0123456789'.includes(val);
