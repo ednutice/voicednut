@@ -3804,7 +3804,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
         : `Keypad (Gather): ${digits}`;
       webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
       const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
-      await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: false });
+      await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true });
 
       if (collection.accepted) {
         const nextExpectation = digitService.getExpectation(callSid);
@@ -3816,17 +3816,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           res.end(twiml);
           return;
         }
-        // Keep the call alive unless the expectation explicitly asked to end it
+        // Keep stream alive; digit service will end call after processing
         const response = new VoiceResponse();
-        const shouldEnd = expectation?.end_call_on_success === true;
         const host = resolveHost(req);
-        if (shouldEnd) {
-          response.say(CALL_END_MESSAGES.success);
-          response.hangup();
-        } else {
-          response.say('Thanks, continuing.');
-          response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
-        }
+        response.say('Thanks, continuing.');
+        response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
         digitService.clearDigitFallbackState(callSid);
         res.type('text/xml');
         res.end(response.toString());

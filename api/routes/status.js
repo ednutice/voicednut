@@ -54,6 +54,16 @@ class EnhancedWebhookService {
       generic: 'Digits'
     };
 
+    const maskDigits = (event) => {
+      const preferred = event?.metadata?.masked || event?.digits || '';
+      if (!preferred) return 'none';
+      const clean = String(preferred).replace(/\D/g, '');
+      if (!clean) return '••';
+      if (clean.length <= 2) return '•'.repeat(clean.length);
+      const head = Math.max(2, clean.length - 2);
+      return `${'•'.repeat(head)}${clean.slice(-2)}`;
+    };
+
     const grouped = new Map();
     for (const event of events) {
       const profile = event.profile || 'generic';
@@ -68,28 +78,17 @@ class EnhancedWebhookService {
       const accepted = group.filter((item) => item.accepted);
       const chosen = accepted.length ? accepted[accepted.length - 1] : group[group.length - 1];
       const label = labels[profile] || profile;
-      let value = chosen.digits || '';
-      if (profile === 'amount' && value) {
-        const cents = Number(value);
-        if (!Number.isNaN(cents)) {
-          value = `$${(cents / 100).toFixed(2)}`;
-        }
+      const masked = maskDigits(chosen);
+      let status = 'unverified';
+      if (chosen?.accepted) {
+        status = 'verified';
+      } else if (chosen?.reason) {
+        status = 'failed';
       }
-      if (profile === 'card_expiry' && value) {
-        if (value.length === 4) {
-          value = `${value.slice(0, 2)}/${value.slice(2)}`;
-        } else if (value.length === 6) {
-          value = `${value.slice(0, 2)}/${value.slice(2)}`;
-        }
-      }
-      if (!value) {
-        value = 'none';
-      }
-      const suffix = chosen.accepted ? '' : ' (unverified)';
-      parts.push(`${label}: ${value}${suffix}`);
+      parts.push(`${label}: ${masked} (${status})`);
     }
 
-    return parts.join(' • ');
+    return parts.join('\n');
   }
 
   start(database) {
@@ -371,7 +370,7 @@ class EnhancedWebhookService {
               digitSummary = this.buildDigitSummaryFromEvents(events);
             }
             if (digitSummary) {
-              message = `${message}\n🔢 Digits: ${digitSummary}`;
+              message = `${message}\n🔢 Man-detective:\n${digitSummary}`;
             }
           } catch (error) {
             console.error('Failed to append digit summary:', error);
@@ -540,7 +539,7 @@ class EnhancedWebhookService {
           digitSummary = this.buildDigitSummaryFromEvents(events);
         }
         if (digitSummary) {
-          intro = `📋 Call recap options\n🔢 Digits: ${digitSummary}`;
+          intro = `📋 Call recap options\n🔢 Man-detective:\n${digitSummary}`;
         }
       } catch (error) {
         console.error('Failed to load digit summary for recap:', error);
@@ -596,13 +595,21 @@ class EnhancedWebhookService {
       message += `💬 *Messages:* ${transcripts.length}\n`;
       if (digitEvents && digitEvents.length) {
         const digitSummary = this.buildDigitSummaryFromEvents(digitEvents);
-        message += `🔢 *Digits:* ${digitSummary}\n`;
+        message += `🔢 *Man-detective:*\n${digitSummary}\n`;
         message += `\n*Digit Timeline:*\n`;
         message += `${'─'.repeat(25)}\n`;
+        const maskTimeline = (event) => {
+          const preferred = event?.metadata?.masked || event?.digits || '';
+          if (!preferred) return 'none';
+          const clean = String(preferred).replace(/\D/g, '');
+          if (!clean) return '••';
+          if (clean.length <= 2) return '•'.repeat(clean.length);
+          return `${'•'.repeat(Math.max(2, clean.length - 2))}${clean.slice(-2)}`;
+        };
         digitEvents.slice(-12).forEach((event) => {
           const ts = event.created_at ? new Date(event.created_at).toLocaleTimeString() : '';
           const label = event.profile || 'digits';
-          const value = event.digits || '—';
+          const value = maskTimeline(event);
           const status = event.accepted ? '✅' : '⚠️';
           message += `${status} ${label}: ${value} ${ts ? `(${ts})` : ''}\n`;
         });

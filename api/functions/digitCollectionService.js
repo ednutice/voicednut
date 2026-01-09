@@ -48,6 +48,33 @@ function createDigitCollectionService(options = {}) {
     minDtmfGapMs = 200
   } = settings;
 
+  function maskDigitsForPreview(digits = '') {
+    if (showRawDigitsLive) return digits || '';
+    const len = String(digits || '').length;
+    if (!len) return '••';
+    const masked = '•'.repeat(Math.max(2, Math.min(6, len)));
+    return len > 6 ? `${masked}…` : masked;
+  }
+
+  function labelForProfile(profile = 'generic') {
+    const map = {
+      verification: 'OTP',
+      otp: 'OTP',
+      account: 'Account',
+      zip: 'ZIP',
+      extension: 'Ext',
+      amount: 'Amount',
+      survey: 'Survey',
+      callback_confirm: 'Callback',
+      card_number: 'Card',
+      cvv: 'CVV',
+      card_expiry: 'Expiry',
+      menu: 'Menu',
+      generic: 'Digits'
+    };
+    return map[String(profile || 'generic').toLowerCase()] || profile || 'Digits';
+  }
+
   const OTP_REGEX = /\b\d{4,8}\b/g;
 
   const digitTimeouts = new Map();
@@ -381,6 +408,8 @@ function createDigitCollectionService(options = {}) {
 
     clearDigitTimeout(callSid);
 
+    const waitMs = Math.max(5000, (exp.timeout_s || 10) * 1000);
+
     const timer = setTimeout(async () => {
       const current = digitCollectionManager.expectations.get(callSid);
       if (!current) return;
@@ -450,7 +479,7 @@ function createDigitCollectionService(options = {}) {
       webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
 
       scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
-    }, (exp.timeout_s || 20) * 1000);
+    }, waitMs);
 
     digitTimeouts.set(callSid, timer);
   }
@@ -1022,6 +1051,19 @@ function createDigitCollectionService(options = {}) {
       logger.error('Error logging digits_collected:', err);
     }
 
+    const liveMasked = maskDigitsForPreview(collection.digits || collection.masked || '');
+    const liveLabel = labelForProfile(collection.profile);
+    if (collection.reason === 'incomplete') {
+      const progressMax = expectation?.max_digits || '';
+      const progress = progressMax ? ` (${collection.len}/${progressMax})` : '';
+      webhookService.addLiveEvent(callSid, `🔢 ${liveLabel} progress: ${liveMasked}${progress}`, { force: true });
+    } else if (collection.accepted) {
+      webhookService.addLiveEvent(callSid, `✅ ${liveLabel} captured: ${liveMasked}`, { force: true });
+    } else {
+      const hint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
+      webhookService.addLiveEvent(callSid, `⚠️ ${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
+    }
+
     if (!collection.accepted && collection.reason === 'incomplete') {
       if (collection.profile === 'verification') {
         const progress = formatOtpForDisplay(collection.digits, 'progress');
@@ -1142,17 +1184,14 @@ function createDigitCollectionService(options = {}) {
             steps: plan.steps.length,
             completed_at: new Date().toISOString()
           }).catch(() => {});
-          if (allowCallEnd && expectation?.end_call_on_success === true) {
-            await speakAndEndCall(callSid, closingMessage, 'digits_collected_plan');
-            return;
-          }
+          await speakAndEndCall(callSid, closingMessage, 'digits_collected_plan');
+          return;
         }
       }
 
-      if (allowCallEnd && expectation?.end_call_on_success === true) {
-        await speakAndEndCall(callSid, closingMessage, collection.profile === 'verification' ? 'otp_verified' : 'digits_collected');
-        return;
-      }
+      // Single-step: always end the call after digits captured
+      await speakAndEndCall(callSid, closingMessage, collection.profile === 'verification' ? 'otp_verified' : 'digits_collected');
+      return;
     } else {
       const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
       webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
