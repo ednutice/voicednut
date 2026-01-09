@@ -1109,8 +1109,14 @@ app.ws('/connection', (ws, req) => {
             interactionCount: 0
           });
 
+          const skipGreeting = callConfig?.initial_prompt_played === true;
+
           // Initialize call with recording
           try {
+            if (skipGreeting) {
+              isInitialized = true;
+              console.log(`Stream reconnected for ${callSid} (skipping greeting)`);
+            } else {
             await recordingService(ttsService, callSid);
             
             const firstMessage = callConfig ? 
@@ -1135,6 +1141,10 @@ app.ws('/connection', (ws, req) => {
               partialResponseIndex: null, 
               partialResponse: firstMessage
             }, 0);
+            if (callConfig) {
+              callConfig.initial_prompt_played = true;
+              callConfigurations.set(callSid, callConfig);
+            }
             if (digitService?.hasExpectation(callSid)) {
               digitService.markDigitPrompted(callSid);
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
@@ -1143,9 +1153,14 @@ app.ws('/connection', (ws, req) => {
             
             isInitialized = true;
             console.log('Adaptive call initialization complete');
+            }
             
           } catch (recordingError) {
             console.error('Recording service error:', recordingError);
+            if (skipGreeting) {
+              isInitialized = true;
+              console.log(`Stream reconnected for ${callSid} (skipping greeting)`);
+            } else {
             
             const firstMessage = callConfig ? 
               callConfig.first_message : 
@@ -1167,6 +1182,10 @@ app.ws('/connection', (ws, req) => {
               partialResponseIndex: null, 
               partialResponse: firstMessage
             }, 0);
+            if (callConfig) {
+              callConfig.initial_prompt_played = true;
+              callConfigurations.set(callSid, callConfig);
+            }
             if (digitService?.hasExpectation(callSid)) {
               digitService.markDigitPrompted(callSid);
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
@@ -1174,6 +1193,7 @@ app.ws('/connection', (ws, req) => {
             scheduleSilenceTimer(callSid);
             
             isInitialized = true;
+            }
           }
 
           // Clean up old configurations
@@ -1294,6 +1314,13 @@ app.ws('/connection', (ws, req) => {
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
+      }
+      if (digitService?.hasExpectation(callSid)) {
+        return;
+      }
+
+      if (digitService?.hasExpectation(callSid)) {
+        return;
       }
 
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {

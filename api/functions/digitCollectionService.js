@@ -75,6 +75,16 @@ function createDigitCollectionService(options = {}) {
     return map[String(profile || 'generic').toLowerCase()] || profile || 'Digits';
   }
 
+  function estimateSpeechDurationMs(text = '') {
+    const words = String(text || '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean).length;
+    if (!words) return 0;
+    const wordsPerMinute = 150;
+    return Math.ceil((words / wordsPerMinute) * 60000);
+  }
+
   function buildExpectedLabel(expectation = {}) {
     const min = expectation.min_digits || 1;
     const max = expectation.max_digits || min;
@@ -276,6 +286,9 @@ function createDigitCollectionService(options = {}) {
       params.timeout_failure_message ?? defaults.timeout_failure_message ?? repromptDefaults.timeout_failure
     );
 
+    const estimatedPromptMs = estimateSpeechDurationMs(params.prompt_hint || '');
+    const adjustedDelayMs = Math.max(minCollectDelayMs, estimatedPromptMs, 3000);
+
     return {
       prompt: `${prompt}${terminatorSuffix}`,
       reprompt_message,
@@ -289,7 +302,7 @@ function createDigitCollectionService(options = {}) {
       max_digits: normalizedMax,
       timeout_s: timeout,
       max_retries: maxRetries,
-      min_collect_delay_ms: minCollectDelayMs,
+      min_collect_delay_ms: adjustedDelayMs,
       menu_options: params.menu_options || [],
       confirmation_style: confirmationStyle,
       allow_spoken_fallback: params.allow_spoken_fallback !== false,
@@ -534,7 +547,9 @@ function createDigitCollectionService(options = {}) {
 
     clearDigitTimeout(callSid);
 
-    const waitMs = Math.max(5000, (exp.timeout_s || 10) * 1000);
+    const timeoutMs = Math.max(5000, (exp.timeout_s || 10) * 1000);
+    const delayMs = Math.max(3000, exp.min_collect_delay_ms || 0);
+    const waitMs = delayMs + timeoutMs;
 
     const timer = setTimeout(async () => {
       const current = digitCollectionManager.expectations.get(callSid);
@@ -1406,7 +1421,9 @@ function createDigitCollectionService(options = {}) {
     requestDigitCollection,
     requestDigitCollectionPlan,
     scheduleDigitTimeout,
-    setExpectation: (callSid, params) => digitCollectionManager.setExpectation(callSid, params)
+    setExpectation: (callSid, params) => digitCollectionManager.setExpectation(callSid, params),
+    isFallbackActive: (callSid) => digitFallbackStates.get(callSid)?.active === true,
+    hasPlan: (callSid) => digitCollectionPlans.has(callSid)
   };
 }
 
