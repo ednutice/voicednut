@@ -1255,13 +1255,6 @@ function createDigitCollectionService(options = {}) {
             last_otp: collection.digits,
             last_otp_masked: collection.masked
           }).catch(() => {});
-          {
-            const cfg = callConfigurations.get(callSid);
-            if (cfg?.user_chat_id) {
-              const msg = `🔐 OTP received for call ${callSid.slice(-6)}: ${collection.digits}`;
-              webhookService.sendTelegramMessage(cfg.user_chat_id, msg).catch(() => {});
-            }
-          }
           await db.updateCallState(callSid, 'otp_captured', {
             masked: collection.masked,
             len: collection.len

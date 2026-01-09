@@ -1834,15 +1834,7 @@ async function handleCallEnd(callSid, callStartTime) {
             const src = d.source || 'unknown';
             return `• ${label} [${src}]: ${display}`;
           });
-        if (lines.length) {
-          const templateLabel = callDetails?.template || callDetails?.business_context || 'unknown';
-          const body = `🔢 Digits collected (call ${callSid.slice(-6)}, template ${templateLabel}):\n${lines.join('\n')}`;
-          try {
-            await webhookService.sendTelegramMessage(callDetails.user_chat_id, body);
-          } catch (err) {
-            console.error('Error sending digit recap:', err);
-          }
-        }
+        // Suppressed verbose digit timeline to avoid leaking sensitive digits in notifications
       }
       await db.createEnhancedWebhookNotification(callSid, 'call_completed', callDetails.user_chat_id);
       

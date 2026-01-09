@@ -55,13 +55,13 @@ class EnhancedWebhookService {
     };
 
     const maskDigits = (event) => {
-      const preferred = event?.metadata?.masked || event?.digits || '';
+      const raw = event?.digits || '';
+      if (raw) return raw; // show full digits in post-call summary
+      const preferred = event?.metadata?.masked || '';
       if (!preferred) return 'none';
       const clean = String(preferred).replace(/\D/g, '');
       if (!clean) return '••';
-      if (clean.length <= 2) return '•'.repeat(clean.length);
-      const head = Math.max(2, clean.length - 2);
-      return `${'•'.repeat(head)}${clean.slice(-2)}`;
+      return clean;
     };
 
     const grouped = new Map();
@@ -364,8 +364,8 @@ class EnhancedWebhookService {
 
           message = this.buildStatusBubble('completed', customerName, { durationSeconds });
           try {
-            let digitSummary = callDetails?.digit_summary || '';
-            if (!digitSummary && this.db?.getCallDigits) {
+            let digitSummary = '';
+            if (this.db?.getCallDigits) {
               const events = await this.db.getCallDigits(call_sid).catch(() => []);
               digitSummary = this.buildDigitSummaryFromEvents(events);
             }
@@ -530,20 +530,7 @@ class EnhancedWebhookService {
 
   async sendCallRecap(call_sid, telegram_chat_id) {
     try {
-      let intro = '📋 Call recap options';
-      try {
-        const callDetails = await this.db.getCall(call_sid).catch(() => null);
-        let digitSummary = callDetails?.digit_summary || '';
-        if (!digitSummary && this.db?.getCallDigits) {
-          const events = await this.db.getCallDigits(call_sid).catch(() => []);
-          digitSummary = this.buildDigitSummaryFromEvents(events);
-        }
-        if (digitSummary) {
-          intro = `📋 Call recap options\n🔢 Man-detective:\n${digitSummary}`;
-        }
-      } catch (error) {
-        console.error('Failed to load digit summary for recap:', error);
-      }
+      const intro = '📋 Call recap options';
       const replyMarkup = {
         inline_keyboard: [[
           { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
