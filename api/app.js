@@ -116,7 +116,7 @@ function applyInitialDigitIntent(callSid, callConfig) {
   if (result.intent?.mode === 'dtmf' && result.expectation) {
     callConfig.first_turn_decided = true;
     callConfigurations.set(callSid, callConfig);
-    webhookService.addLiveEvent(callSid, `🔢 DTMF intent detected (${result.intent.reason})`, { force: true });
+    webhookService.addLiveEvent(callSid, `🔢 Man detected (${result.intent.reason})`, { force: true });
   }
   return result;
 }

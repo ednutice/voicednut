@@ -75,6 +75,101 @@ function createDigitCollectionService(options = {}) {
     return map[String(profile || 'generic').toLowerCase()] || profile || 'Digits';
   }
 
+  function buildExpectedLabel(expectation = {}) {
+    const min = expectation.min_digits || 1;
+    const max = expectation.max_digits || min;
+    const digitLabel = min === max ? `${min}-digit` : `${min}-${max} digit`;
+    const profile = String(expectation.profile || 'generic').toLowerCase();
+    switch (profile) {
+      case 'menu':
+        return 'menu option';
+      case 'extension':
+        return 'extension';
+      case 'zip':
+        return 'ZIP code';
+      case 'account':
+        return 'account number';
+      case 'cvv':
+        return 'security code';
+      case 'card_number':
+        return 'card number';
+      case 'card_expiry':
+        return 'expiry date';
+      case 'amount':
+        return 'amount';
+      case 'survey':
+        return 'rating';
+      case 'callback_confirm':
+        return 'phone number';
+      case 'verification':
+      case 'otp':
+        return `${digitLabel} code`;
+      default:
+        return `${digitLabel} code`;
+    }
+  }
+
+  function buildDefaultReprompts(expectation = {}) {
+    const label = buildExpectedLabel(expectation);
+    const profile = String(expectation.profile || 'generic').toLowerCase();
+    if (profile === 'menu') {
+      return {
+        invalid: [
+          'That option was not valid. Please press a valid menu option now.',
+          'Please press a valid menu option now.',
+          'Last try: press a valid menu option now.'
+        ],
+        timeout: [
+          'I did not receive a selection. Please press a menu option now.',
+          'Please press a menu option now.',
+          'Last try: press a menu option now.'
+        ],
+        failure: 'No valid selection was received. Thank you. Goodbye.',
+        timeout_failure: 'No selection was received. Thank you. Goodbye.'
+      };
+    }
+    return {
+      invalid: [
+        `That did not match. Please enter the ${label} now.`,
+        `Please enter the ${label} now.`,
+        `Last try: enter the ${label} now.`
+      ],
+      timeout: [
+        `I did not receive any input. Please enter the ${label} now.`,
+        `Please enter the ${label} now.`,
+        `Last try: enter the ${label} now.`
+      ],
+      failure: `We could not verify the ${label}. Thank you for your time. Goodbye.`,
+      timeout_failure: `No input received for the ${label}. Thank you for your time. Goodbye.`
+    };
+  }
+
+  function normalizeRepromptValue(value) {
+    if (Array.isArray(value)) {
+      const trimmed = value.map((item) => String(item || '').trim()).filter(Boolean);
+      return trimmed.length ? trimmed : '';
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || '';
+    }
+    return '';
+  }
+
+  function chooseReprompt(expectation = {}, kind = 'invalid', attempt = 1) {
+    const key = kind === 'timeout'
+      ? expectation.reprompt_timeout
+      : kind === 'incomplete'
+        ? expectation.reprompt_incomplete
+        : expectation.reprompt_invalid;
+    if (Array.isArray(key) && key.length) {
+      const idx = Math.max(0, Math.min(key.length - 1, (attempt || 1) - 1));
+      return key[idx];
+    }
+    if (typeof key === 'string' && key.trim()) return key.trim();
+    return '';
+  }
+
   const OTP_REGEX = /\b\d{4,8}\b/g;
 
   const digitTimeouts = new Map();
@@ -83,14 +178,14 @@ function createDigitCollectionService(options = {}) {
   const lastDtmfTimestamps = new Map();
 
   const DIGIT_PROFILE_DEFAULTS = {
-    verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false, prompt: 'Please enter the verification code using your keypad.' },
-    otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false, prompt: 'Please enter the one-time code on your keypad.' },
-    cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Enter the 3 or 4 digit security code using your keypad.' },
-    card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: false, prompt: 'Please enter the card number using your keypad.' },
-    card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Enter the card expiry as MMYY (or MMYYYY) on your keypad.' },
-    zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false, prompt: 'Please enter the ZIP code using your keypad.' },
-    extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Enter the extension using your keypad.' },
-    menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false, prompt: 'Please press a keypad option now.' }
+    verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false },
+    otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false },
+    cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: false },
+    card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false },
+    menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false }
   };
 
   function getDigitProfileDefaults(profile = 'generic') {
@@ -134,7 +229,8 @@ function createDigitCollectionService(options = {}) {
       : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : false);
     const prompt = params.prompt && String(params.prompt).trim().length > 0
       ? params.prompt
-      : (defaults.prompt || 'Please enter the digits now.');
+      : '';
+    const reprompt_message = params.reprompt_message || defaults.reprompt_message || '';
     const terminatorChar = params.terminator_char || defaults.terminator_char || '#';
     const allowTerminator = params.allow_terminator === true || defaults.allow_terminator === true;
     const terminatorSuffix = allowTerminator
@@ -156,8 +252,38 @@ function createDigitCollectionService(options = {}) {
       if (normalizedMax > 8) normalizedMax = 8;
     }
 
+    const repromptDefaults = buildDefaultReprompts({
+      profile,
+      min_digits: normalizedMin,
+      max_digits: normalizedMax,
+      allow_terminator: allowTerminator,
+      terminator_char: terminatorChar
+    });
+
+    const reprompt_invalid = normalizeRepromptValue(
+      params.reprompt_invalid ?? defaults.reprompt_invalid ?? repromptDefaults.invalid
+    );
+    const reprompt_incomplete = normalizeRepromptValue(
+      params.reprompt_incomplete ?? defaults.reprompt_incomplete ?? repromptDefaults.invalid
+    );
+    const reprompt_timeout = normalizeRepromptValue(
+      params.reprompt_timeout ?? defaults.reprompt_timeout ?? repromptDefaults.timeout
+    );
+    const failure_message = normalizeRepromptValue(
+      params.failure_message ?? defaults.failure_message ?? repromptDefaults.failure
+    );
+    const timeout_failure_message = normalizeRepromptValue(
+      params.timeout_failure_message ?? defaults.timeout_failure_message ?? repromptDefaults.timeout_failure
+    );
+
     return {
       prompt: `${prompt}${terminatorSuffix}`,
+      reprompt_message,
+      reprompt_invalid,
+      reprompt_incomplete,
+      reprompt_timeout,
+      failure_message,
+      timeout_failure_message,
       profile,
       min_digits: normalizedMin,
       max_digits: normalizedMax,
@@ -179,7 +305,7 @@ function createDigitCollectionService(options = {}) {
     const min = expectation?.min_digits || 1;
     const max = expectation?.max_digits || min;
     const label = min === max ? `${min}-digit` : `${min}-${max} digit`;
-    return expectation?.prompt || `Please enter the ${label} code using your keypad.`;
+    return `Please enter the ${label} code using your keypad.`;
   }
 
   function clearDigitTimeout(callSid) {
@@ -453,13 +579,13 @@ function createDigitCollectionService(options = {}) {
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
-        await speakAndEndCall(callSid, callEndMessages.no_response, 'digit_collection_timeout');
+        const finalTimeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
+        await speakAndEndCall(callSid, finalTimeoutMessage, 'digit_collection_timeout');
         return;
       }
 
-      const expectedText = `${current.min_digits || ''}${current.max_digits ? `-${current.max_digits}` : ''}`.replace(/-$/, '');
-      const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
-      const prompt = `I did not catch that. Please re-enter the ${expectedLabel} using your keypad.`;
+      const prompt = chooseReprompt(current, 'timeout', current.retries)
+        || `I did not catch that. Please re-enter the ${buildExpectedLabel(current)} now.`;
 
       const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
       const reply = {
@@ -534,7 +660,7 @@ function createDigitCollectionService(options = {}) {
       lastAt: new Date().toISOString()
     });
 
-    webhookService.addLiveEvent(callSid, '📟 Using Twilio Gather fallback', { force: true });
+    webhookService.addLiveEvent(callSid, '📟 Capturing Mode', { force: true });
     return true;
   }
 
@@ -669,7 +795,7 @@ function createDigitCollectionService(options = {}) {
     const speak_confirmation = typeof callConfig.collection_speak_confirmation === 'boolean'
       ? callConfig.collection_speak_confirmation
       : false;
-    const prompt = callConfig.first_message || defaults.prompt || 'Please enter the digits now.';
+    const prompt = ''; // initial prompt now comes from bot payload, not profile
     const end_call_on_success = (profile === 'verification' || profile === 'otp')
       ? true
       : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : false);
@@ -710,7 +836,7 @@ function createDigitCollectionService(options = {}) {
         min_digits: len,
         max_digits: len,
         force_exact_length: len,
-        prompt: 'Please enter the code on your keypad now.',
+        prompt: '',
         end_call_on_success: true,
         max_retries: otpMaxRetries,
         confidence: 0.95,
@@ -727,9 +853,7 @@ function createDigitCollectionService(options = {}) {
         min_digits: len,
         max_digits: len,
         force_exact_length: tpl.default_profile === 'menu' ? undefined : len,
-        prompt: tpl.default_profile === 'menu'
-          ? 'Please press your menu option now.'
-          : 'Please enter the code on your keypad now.',
+        prompt: '',
         end_call_on_success: tpl.default_profile === 'verification',
         max_retries: otpMaxRetries,
         confidence: 0.8,
@@ -745,7 +869,7 @@ function createDigitCollectionService(options = {}) {
         min_digits: sixMention ? 6 : (digitLen || otpLength),
         max_digits: sixMention ? 6 : (digitLen || otpLength),
         force_exact_length: sixMention ? 6 : undefined,
-        prompt: 'Please enter the code on your keypad now.',
+        prompt: '',
         end_call_on_success: true,
         max_retries: otpMaxRetries,
         confidence: 0.75,
@@ -760,7 +884,7 @@ function createDigitCollectionService(options = {}) {
         profile: 'menu',
         min_digits: 1,
         max_digits: 1,
-        prompt: 'Please press your menu option now.',
+        prompt: '',
         end_call_on_success: false,
         max_retries: 2,
         confidence: 0.65,
@@ -778,7 +902,7 @@ function createDigitCollectionService(options = {}) {
         max_digits: Math.max(len, 10),
         confirmation_style: 'last4',
         speak_confirmation: false,
-        prompt: 'Please enter your account or confirmation number using your keypad.',
+        prompt: '',
         end_call_on_success: false,
         max_retries: 2,
         confidence: 0.6,
@@ -847,6 +971,7 @@ function createDigitCollectionService(options = {}) {
     }
     const payload = normalizeDigitExpectation({
       ...intent.expectation,
+      prompt: '',
       prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
     });
     payload.reason = intent.reason || 'initial_intent';
@@ -870,6 +995,7 @@ function createDigitCollectionService(options = {}) {
     }
     const payload = normalizeDigitExpectation({
       ...decision,
+      prompt: '',
       prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
     });
     payload.reason = decision.reason || 'first_turn';
@@ -880,9 +1006,9 @@ function createDigitCollectionService(options = {}) {
     if (gptService) {
       scheduleDigitTimeout(callSid, gptService, interactionCount);
     }
-    const instruction = payload.min_digits === payload.max_digits
+    const instruction = callConfig.first_message || callConfig.prompt || (payload.min_digits === payload.max_digits
       ? `Please enter the ${payload.min_digits} digit code on your keypad now.`
-      : `Please enter between ${payload.min_digits} and ${payload.max_digits} digits on your keypad now.`;
+      : `Please enter between ${payload.min_digits} and ${payload.max_digits} digits on your keypad now.`);
     webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
     if (gptService) {
       gptService.emit('gptreply', {
@@ -901,10 +1027,10 @@ function createDigitCollectionService(options = {}) {
     if (!plan || !Array.isArray(plan.steps) || plan.index >= plan.steps.length) return;
     const step = plan.steps[plan.index];
     const callConfig = callConfigurations.get(callSid);
-    const promptHint = [step?.prompt, callConfig?.first_message, callConfig?.prompt]
+    const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
       .join(' ');
-    const payload = normalizeDigitExpectation({ ...step, prompt_hint: promptHint });
+    const payload = normalizeDigitExpectation({ ...step, prompt: '', prompt_hint: promptHint });
     payload.plan_id = plan.id;
     payload.plan_step_index = plan.index + 1;
     payload.plan_total_steps = plan.steps.length;
@@ -927,9 +1053,10 @@ function createDigitCollectionService(options = {}) {
     webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
 
     if (gptService) {
+      const spokenPrompt = callConfig?.first_message || callConfig?.prompt || 'Please enter the digits now.';
       const instruction = payload.plan_total_steps
-        ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`
-        : `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
+        ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${spokenPrompt}`
+        : spokenPrompt;
       gptService.emit('gptreply', {
         partialResponseIndex: null,
         partialResponse: instruction,
@@ -948,10 +1075,10 @@ function createDigitCollectionService(options = {}) {
       clearDigitPlan(callSid);
     }
     const callConfig = callConfigurations.get(callSid);
-    const promptHint = [args.prompt, callConfig?.first_message, callConfig?.prompt]
+    const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
       .join(' ');
-    const payload = normalizeDigitExpectation({ ...args, prompt_hint: promptHint });
+    const payload = normalizeDigitExpectation({ ...args, prompt: '', prompt_hint: promptHint });
     try {
       await db.updateCallState(callSid, 'digit_collection_requested', payload);
       webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
@@ -961,7 +1088,8 @@ function createDigitCollectionService(options = {}) {
       }
       scheduleDigitTimeout(callSid, gptService, 0);
       if (gptService) {
-        const instruction = `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad. I will not repeat it back. ${payload.prompt}`;
+        const spokenPrompt = callConfig?.first_message || callConfig?.prompt || `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad now.`;
+        const instruction = spokenPrompt;
         const reply = {
           partialResponseIndex: null,
           partialResponse: instruction,
@@ -969,7 +1097,7 @@ function createDigitCollectionService(options = {}) {
           adaptationHistory: gptService.personalityChanges?.slice(-3) || []
         };
         gptService.emit('gptreply', reply, 0);
-        gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits. Prompt: ${payload.prompt}`);
+        gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits.`);
         markDigitPrompted(callSid);
       }
     } catch (err) {
@@ -1013,8 +1141,7 @@ function createDigitCollectionService(options = {}) {
     if (!collection) return;
     const allowCallEnd = options.allowCallEnd === true;
     const expectation = digitCollectionManager.expectations.get(callSid);
-    const expectedText = expectation ? `${expectation.min_digits || ''}${expectation.max_digits ? `-${expectation.max_digits}` : ''}`.replace(/-$/, '') : '';
-    const expectedLabel = expectedText ? `${expectedText} digit code` : 'the code';
+    const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
     const payload = {
       profile: collection.profile,
       raw_digits: collection.digits,
@@ -1196,9 +1323,10 @@ function createDigitCollectionService(options = {}) {
       const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
       webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
       if (collection.fallback) {
+        const failureMessage = expectation?.failure_message || callEndMessages.failure || 'I could not verify the digits. Thank you for your time.';
         const fallbackMsg = fallbackToVoiceOnFailure
           ? 'I could not verify the digits. I will continue the call without keypad entry.'
-          : 'I could not verify the digits. Thank you for your time.';
+          : failureMessage;
         webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${fallbackToVoiceOnFailure ? 'switching to voice' : 'ending call'}`, { force: true });
         digitCollectionManager.expectations.delete(callSid);
         clearDigitTimeout(callSid);
@@ -1209,43 +1337,22 @@ function createDigitCollectionService(options = {}) {
           return;
         }
         if (allowCallEnd) {
-          await speakAndEndCall(callSid, callEndMessages.failure, 'digit_collection_failed');
+          await speakAndEndCall(callSid, failureMessage, 'digit_collection_failed');
           return;
         }
         emitReply(fallbackMsg);
       } else {
         let prompt = '';
         if (collection.reason === 'too_fast') {
-          prompt = 'That was too fast to read. Please enter the digits again a bit slower.';
+          prompt = 'That was too fast. Please enter the digits again slowly.';
         } else if (collection.reason === 'spam_pattern') {
           prompt = 'That pattern did not look right. Please enter the correct digits now.';
-        } else if (collection.profile === 'card_number') {
-          prompt = collection.retries >= 2
-            ? 'Last try: enter the full card number on your keypad now.'
-            : 'That card number did not go through. Please re-enter the card number using your keypad.';
-        } else if (collection.profile === 'cvv') {
-          prompt = collection.retries >= 2
-            ? 'Last try: enter the 3 or 4 digit CVV on your keypad.'
-            : 'That security code did not go through. Please enter the 3 or 4 digit CVV using your keypad.';
-        } else if (collection.profile === 'card_expiry') {
-          prompt = collection.retries >= 2
-            ? 'Last try: enter the expiry as MMYY (or MMYYYY) now.'
-            : 'That expiry date did not go through. Please enter it as MMYY (or MMYYYY) using your keypad.';
-        } else if (collection.profile === 'verification') {
-          prompt = collection.retries >= 2
-            ? 'Last try: enter the 6 digit code now.'
-            : collection.retries === 1
-              ? 'Please enter the 6 digit code now on your keypad.'
-              : "That didn't sound like 6 digits. Please enter the 6 digit code again on your keypad.";
+        } else if (collection.reason === 'too_short') {
+          prompt = chooseReprompt(expectation || {}, 'incomplete', collection.retries || 1)
+            || `Please enter the ${expectedLabel} now.`;
         } else {
-          const prompts = [
-            `That did not go through. Please re-enter the ${expectedLabel} using your keypad.`,
-            `I could not read that. Enter the ${expectedLabel} again on your keypad, please.`,
-            `Let's try once more—type the ${expectedLabel} on your keypad now.`
-          ];
-          prompt = collection.retries >= 2
-            ? `Last try: enter the ${expectedLabel} now.`
-            : prompts[Math.floor(Math.random() * prompts.length)];
+          prompt = chooseReprompt(expectation || {}, 'invalid', collection.retries || 1)
+            || `Please enter the ${expectedLabel} now.`;
         }
         emitReply(prompt);
         if (gptService) {
