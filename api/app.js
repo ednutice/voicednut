@@ -2384,34 +2384,6 @@ app.ws('/connection', (ws, req) => {
         recordFirstTurnDecision(callSid, null);
       }
 
-      const callConfig = callConfigurations.get(callSid);
-      if (interactionCount === 1 && callConfig && !callConfig.first_turn_decided) {
-        const decision = detectFirstTurnDigitPlan(otpContext.raw, callConfig);
-        callConfig.first_turn_decided = true;
-        callConfigurations.set(callSid, callConfig);
-        if (decision) {
-          const payload = normalizeDigitExpectation({
-            ...decision,
-            prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
-          });
-          payload.reason = decision.reason || 'first_turn';
-          digitCollectionManager.setExpectation(callSid, payload);
-          clearSilenceTimer(callSid);
-          scheduleDigitTimeout(callSid, gptService, interactionCount);
-          const instruction = `Please enter ${payload.min_digits === payload.max_digits ? `the ${payload.min_digits} digit code` : `between ${payload.min_digits} and ${payload.max_digits} digits`} on your keypad now.`;
-          webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
-          gptService.emit('gptreply', {
-            partialResponseIndex: null,
-            partialResponse: instruction,
-            personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
-            adaptationHistory: gptService.personalityChanges?.slice(-3) || []
-          }, interactionCount);
-          markDigitPrompted(callSid);
-          recordFirstTurnDecision(callSid, { ...decision, confidence: 0.8 });
-          return;
-        }
-        recordFirstTurnDecision(callSid, null);
-      }
     });
     
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
