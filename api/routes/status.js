@@ -33,6 +33,36 @@ class EnhancedWebhookService {
     this.mediaSeen = new Map();
   }
 
+  normalizeStatus(value) {
+    return String(value || '').toLowerCase().replace(/_/g, '-');
+  }
+
+  isTerminalStatus(status) {
+    return ['completed', 'no-answer', 'busy', 'failed', 'canceled'].includes(status);
+  }
+
+  formatContactLabel(phoneNumber) {
+    const digits = String(phoneNumber || '').replace(/\D/g, '');
+    if (digits.length >= 4) {
+      return `the contact ending ${digits.slice(-4)}`;
+    }
+    return 'the contact';
+  }
+
+  buildRetryActions(callSid) {
+    return {
+      inline_keyboard: [
+        [
+          { text: '🔁 Retry now', callback_data: `retry:now:${callSid}` },
+          { text: '⏲ Retry in 15m', callback_data: `retry:15m:${callSid}` }
+        ],
+        [
+          { text: '💬 Send SMS', callback_data: `retry:sms:${callSid}` }
+        ]
+      ]
+    };
+  }
+
   buildDigitSummaryFromEvents(events = []) {
     if (!Array.isArray(events) || events.length === 0) {
       return '';
@@ -258,7 +288,8 @@ class EnhancedWebhookService {
         : undefined;
 
       await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
-        ring_duration: ringDuration
+        ring_duration: ringDuration,
+        status_source: 'inferred'
       });
     }, this.noResponseTimeoutMs);
     this.noResponseTimers.set(call_sid, timer);
@@ -275,22 +306,27 @@ class EnhancedWebhookService {
   // Enhanced call status update with proper no-answer detection
   async sendCallStatusUpdate(call_sid, status, telegram_chat_id, additionalData = {}) {
     try {
-      const normalizedStatus = String(status || '').toLowerCase().replace(/_/g, '-');
+      const normalizedStatus = this.normalizeStatus(status);
       if (!this.callTimestamps.has(call_sid)) {
         this.callTimestamps.set(call_sid, { started: new Date() });
       }
       const callTiming = this.callTimestamps.get(call_sid);
       const callDetails = await this.db.getCall(call_sid).catch(() => null);
+      const persistedStatus = this.normalizeStatus(callDetails?.status || callDetails?.twilio_status);
+      const effectiveStatus = this.isTerminalStatus(persistedStatus) ? persistedStatus : normalizedStatus;
       const callMeta = await this.getCallMeta(call_sid, callDetails);
       const statusInfo = this.activeCallStatus.get(call_sid);
 
-      const correctedStatus = this.correctStatusForEvidence(normalizedStatus, {
+      const correctedStatus = this.correctStatusForEvidence(effectiveStatus, {
         callSid: call_sid,
         callTiming,
         callDetails,
         statusInfo,
         additionalData
       });
+      const statusSource = correctedStatus !== effectiveStatus
+        ? 'inferred'
+        : (additionalData.status_source || 'provider');
 
       const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
 
@@ -438,17 +474,19 @@ class EnhancedWebhookService {
           message = this.buildStatusBubble(correctedStatus, customerName);
       }
 
-      const fullMessage = message;
+      const fullMessage = `${message}\nSource: ${statusSource}`;
       const shouldSendBubble = ['completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled'];
+      const shouldOfferRetry = ['failed', 'busy', 'no-answer'].includes(correctedStatus);
 
       if (shouldSendBubble.includes(correctedStatus)) {
-        await this.sendTelegramMessage(telegram_chat_id, fullMessage);
+        const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
+        await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup });
         console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`);
       } else {
         console.log(`⏭️ Console-only status ${correctedStatus} for call ${call_sid}`);
       }
       await consolePromise;
-      await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id);
+      await this.updateLiveConsoleStatus(call_sid, correctedStatus, telegram_chat_id, statusSource);
 
       // Log notification metric
       if (this.db && this.db.logNotificationMetric) {
@@ -530,7 +568,8 @@ class EnhancedWebhookService {
 
   async sendCallRecap(call_sid, telegram_chat_id) {
     try {
-      const intro = '📋 Call recap options';
+      const callMeta = await this.getCallMeta(call_sid);
+      const intro = `📋 Call recap options for ${callMeta.customerName || 'the contact'}`;
       const replyMarkup = {
         inline_keyboard: [[
           { text: '📩 Send recap via SMS', callback_data: `recap:sms:${call_sid}` },
@@ -643,25 +682,27 @@ class EnhancedWebhookService {
       switch (notification_type) {
         case 'call_initiated':
         case 'call_queued':
-          success = await this.sendCallStatusUpdate(call_sid, 'initiated', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'initiated', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_ringing':
-          success = await this.sendCallStatusUpdate(call_sid, 'ringing', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'ringing', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_answered':
-          success = await this.sendCallStatusUpdate(call_sid, 'answered', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'answered', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_in_progress':
-          success = await this.sendCallStatusUpdate(call_sid, 'in-progress', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'in-progress', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_completed':
           const callDetails = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'completed', telegram_chat_id, { 
-            duration: callDetails?.duration 
+            duration: callDetails?.duration,
+            status_source: 'provider'
           });
           break;
         case 'call_recap':
-          success = await this.sendCallRecap(call_sid, telegram_chat_id);
+          // Deprecated: recap options should not be pushed in status notifications
+          success = true;
           break;
         case 'call_transcript':
           success = await this.sendCallTranscript(call_sid, telegram_chat_id);
@@ -669,21 +710,23 @@ class EnhancedWebhookService {
         case 'call_failed':
           const failedCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'failed', telegram_chat_id, { 
-            error_message: failedCall?.error_message 
+            error_message: failedCall?.error_message,
+            status_source: 'provider'
           });
           break;
         case 'call_busy':
-          success = await this.sendCallStatusUpdate(call_sid, 'busy', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'busy', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_no_answer':
         case 'call_no-answer':
           const noAnswerCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
-            ring_duration: noAnswerCall?.ring_duration
+            ring_duration: noAnswerCall?.ring_duration,
+            status_source: 'provider'
           });
           break;
         case 'call_canceled':
-          success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id, { status_source: 'provider' });
           break;
         case 'call_stream_started':
           // Informational only; mark as processed without noisy logs
@@ -691,7 +734,7 @@ class EnhancedWebhookService {
           break;
         default:
         console.warn(`⚠️ Unknown notification type: ${notification_type}`);
-          success = await this.sendCallStatusUpdate(call_sid, notification_type.replace('call_', ''), telegram_chat_id);
+          success = await this.sendCallStatusUpdate(call_sid, notification_type.replace('call_', ''), telegram_chat_id, { status_source: 'provider' });
       }
 
       if (success) {
@@ -931,9 +974,13 @@ class EnhancedWebhookService {
       state = null;
     }
 
+    const phoneNumber = details?.phone_number || state?.phone_number || '';
+    const customerName = state?.customer_name || details?.customer_name || '';
+    const label = customerName || this.formatContactLabel(phoneNumber);
+
     return {
-      customerName: state?.customer_name || details?.customer_name || 'Unknown',
-      phoneNumber: details?.phone_number || state?.phone_number || 'Unknown',
+      customerName: label,
+      phoneNumber: phoneNumber || 'Unknown',
       template: state?.template || details?.template || '—'
     };
   }
@@ -952,6 +999,7 @@ class EnhancedWebhookService {
       pickedUpAt: null,
       endedAt: null,
       status: `📡 Connecting to ${meta.customerName || 'customer'}…`,
+      statusSource: 'provider',
       phase: this.getConsolePhaseLabel('waiting'),
       lastEvents: [],
       previewTurns: { user: '—', agent: '—' },
@@ -1019,11 +1067,14 @@ class EnhancedWebhookService {
     };
   }
 
-  updateLiveConsoleStatus(callSid, status, chatId) {
+  updateLiveConsoleStatus(callSid, status, chatId, statusSource = null) {
     const entry = this.liveConsoleByCallSid.get(callSid);
     if (!entry) return;
 
     entry.status = this.getConsoleStatusLabel(status);
+    if (statusSource) {
+      entry.statusSource = statusSource;
+    }
     const statusEvent = this.statusEventText(status, entry.customerName);
     if (['answered', 'in-progress'].includes(status) && !entry.pickedUpAt) {
       entry.pickedUpAt = new Date();
@@ -1155,6 +1206,7 @@ class EnhancedWebhookService {
 
     return [
       `🎧 Live Call • ${entry.status}`,
+      `Source: ${entry.statusSource || 'provider'}`,
       `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
       entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
       `⏱ ${elapsed} | Phase: ${phaseLine}`,
@@ -1428,7 +1480,7 @@ class EnhancedWebhookService {
   // Enhanced immediate status update with better error handling
   async sendImmediateStatus(call_sid, status, telegram_chat_id) {
     try {
-      return await this.sendCallStatusUpdate(call_sid, status, telegram_chat_id);
+      return await this.sendCallStatusUpdate(call_sid, status, telegram_chat_id, { status_source: 'manual' });
     } catch (error) {
       console.error(`❌ Failed to send immediate status for ${call_sid}:`, error);
       // Try to send a generic notification

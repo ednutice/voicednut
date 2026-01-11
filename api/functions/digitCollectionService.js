@@ -186,6 +186,7 @@ function createDigitCollectionService(options = {}) {
   const digitFallbackStates = new Map();
   const digitCollectionPlans = new Map();
   const lastDtmfTimestamps = new Map();
+  const pendingDigits = new Map();
 
   const DIGIT_PROFILE_DEFAULTS = {
     verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false },
@@ -348,11 +349,46 @@ function createDigitCollectionService(options = {}) {
     }
   }
 
-  function markDigitPrompted(callSid) {
+  function markDigitPrompted(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
     const expectation = digitCollectionManager.expectations.get(callSid);
-    if (!expectation) return;
+    if (!expectation) return false;
     expectation.prompted_at = Date.now();
     digitCollectionManager.expectations.set(callSid, expectation);
+    if (gptService) {
+      void flushBufferedDigits(callSid, gptService, interactionCount, source, options);
+    }
+    return true;
+  }
+
+  function bufferDigits(callSid, digits = '', meta = {}) {
+    if (!callSid || !digits) return;
+    const existing = pendingDigits.get(callSid) || [];
+    existing.push({ digits: String(digits), meta });
+    pendingDigits.set(callSid, existing);
+  }
+
+  async function flushBufferedDigits(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
+    const queue = pendingDigits.get(callSid);
+    if (!queue || queue.length === 0) return false;
+
+    let processed = false;
+    while (queue.length > 0) {
+      if (!digitCollectionManager.expectations.has(callSid)) {
+        break;
+      }
+      const item = queue.shift();
+      const collection = digitCollectionManager.recordDigits(callSid, item.digits, item.meta || {});
+      processed = true;
+      await handleCollectionResult(callSid, collection, gptService, interactionCount, source, options);
+    }
+
+    if (queue.length === 0) {
+      pendingDigits.delete(callSid);
+    } else {
+      pendingDigits.set(callSid, queue);
+    }
+
+    return processed;
   }
 
   function isValidLuhn(value = '') {
@@ -1004,9 +1040,6 @@ function createDigitCollectionService(options = {}) {
     if (typeof clearSilenceTimer === 'function') {
       clearSilenceTimer(callSid);
     }
-    if (gptService) {
-      scheduleDigitTimeout(callSid, gptService, interactionCount);
-    }
 
     try {
       await db.updateCallState(callSid, 'digit_collection_requested', payload);
@@ -1016,6 +1049,20 @@ function createDigitCollectionService(options = {}) {
 
     const stepLabel = payload.profile || 'digits';
     webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
+
+    await flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+    const currentExpectation = digitCollectionManager.expectations.get(callSid);
+    if (!currentExpectation) {
+      return;
+    }
+    if (currentExpectation.plan_id && currentExpectation.plan_id !== payload.plan_id) {
+      return;
+    }
+    if (currentExpectation.plan_step_index && currentExpectation.plan_step_index !== payload.plan_step_index) {
+      return;
+    }
+
+    scheduleDigitTimeout(callSid, gptService, interactionCount);
 
     if (gptService) {
       const spokenPrompt = callConfig?.first_message || callConfig?.prompt || 'Please enter the digits now.';
@@ -1031,7 +1078,7 @@ function createDigitCollectionService(options = {}) {
       try {
         gptService.updateUserContext('digit_collection_plan', 'system', `Digit plan step ${payload.plan_step_index}/${payload.plan_total_steps} (${payload.profile})`);
       } catch (_) {}
-      markDigitPrompted(callSid);
+      markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
     }
   }
 
@@ -1052,6 +1099,10 @@ function createDigitCollectionService(options = {}) {
       if (typeof clearSilenceTimer === 'function') {
         clearSilenceTimer(callSid);
       }
+      await flushBufferedDigits(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
+      if (!digitCollectionManager.expectations.has(callSid)) {
+        return payload;
+      }
       scheduleDigitTimeout(callSid, gptService, 0);
       if (gptService) {
         const spokenPrompt = callConfig?.first_message || callConfig?.prompt || `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad now.`;
@@ -1064,7 +1115,7 @@ function createDigitCollectionService(options = {}) {
         };
         gptService.emit('gptreply', reply, 0);
         gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits.`);
-        markDigitPrompted(callSid);
+        markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
       }
     } catch (err) {
       logger.error('collect_digits handler error:', err);
@@ -1339,6 +1390,7 @@ function createDigitCollectionService(options = {}) {
     clearDigitFallbackState(callSid);
     clearDigitPlan(callSid);
     lastDtmfTimestamps.delete(callSid);
+    pendingDigits.delete(callSid);
   }
 
   return {
@@ -1360,6 +1412,8 @@ function createDigitCollectionService(options = {}) {
     markDigitPrompted,
     maskOtpForExternal,
     normalizeDigitExpectation,
+    bufferDigits,
+    flushBufferedDigits,
     prepareInitialExpectation,
     recordDigits: (callSid, digits, meta) => digitCollectionManager.recordDigits(callSid, digits, meta),
     requestDigitCollection,

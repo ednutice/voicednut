@@ -109,13 +109,21 @@ function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
   silenceTimers.set(callSid, timer);
 }
 
-function applyInitialDigitIntent(callSid, callConfig) {
+async function applyInitialDigitIntent(callSid, callConfig, gptService = null, interactionCount = 0) {
   if (!digitService || !callConfig) return null;
   if (callConfig.digit_intent) {
-    return {
+    const existing = {
       intent: callConfig.digit_intent,
       expectation: digitService.getExpectation(callSid) || null
     };
+    if (existing.intent?.mode === 'dtmf' && existing.expectation) {
+      try {
+        await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+      } catch (err) {
+        console.error('Flush buffered digits error:', err);
+      }
+    }
+    return existing;
   }
   const result = digitService.prepareInitialExpectation(callSid, callConfig);
   callConfig.digit_intent = result.intent;
@@ -124,6 +132,13 @@ function applyInitialDigitIntent(callSid, callConfig) {
     webhookService.addLiveEvent(callSid, `🔢 DTMF intent detected (${result.intent.reason})`, { force: true });
   } else {
     webhookService.addLiveEvent(callSid, `🗣️ Normal call flow (${result.intent?.reason || 'no_signal'})`, { force: true });
+  }
+  if (result.intent?.mode === 'dtmf' && result.expectation) {
+    try {
+      await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+    } catch (err) {
+      console.error('Flush buffered digits error:', err);
+    }
   }
   return result;
 }
@@ -282,6 +297,32 @@ const callFunctionSystems = new Map(); // Store generated functions per call
 const callEndLocks = new Map();
 const silenceTimers = new Map();
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
+const gptQueues = new Map();
+
+function enqueueGptTask(callSid, task) {
+  if (!callSid || typeof task !== 'function') {
+    return Promise.resolve();
+  }
+  const current = gptQueues.get(callSid) || Promise.resolve();
+  const next = current
+    .then(task)
+    .catch((err) => {
+      console.error('GPT queue error:', err);
+    })
+    .finally(() => {
+      if (gptQueues.get(callSid) === next) {
+        gptQueues.delete(callSid);
+      }
+    });
+  gptQueues.set(callSid, next);
+  return next;
+}
+
+function clearGptQueue(callSid) {
+  if (callSid) {
+    gptQueues.delete(callSid);
+  }
+}
 
 const ALLOWED_TWILIO_STREAM_TRACKS = new Set(['inbound_track', 'outbound_track', 'both_tracks']);
 const TWILIO_STREAM_TRACK = ALLOWED_TWILIO_STREAM_TRACKS.has((process.env.TWILIO_STREAM_TRACK || '').toLowerCase())
@@ -484,13 +525,51 @@ function formatDurationForSms(seconds) {
   return `${mins}m ${secs}s`;
 }
 
+function normalizeCallStatus(value) {
+  return String(value || '').toLowerCase().replace(/_/g, '-');
+}
+
+function formatContactLabel(call) {
+  if (call?.customer_name) return call.customer_name;
+  const digits = String(call?.phone_number || call?.number || '').replace(/\D/g, '');
+  if (digits.length >= 4) {
+    return `the contact ending ${digits.slice(-4)}`;
+  }
+  return 'the contact';
+}
+
+function buildOutcomeSummary(call, status) {
+  const label = formatContactLabel(call);
+  switch (status) {
+    case 'no-answer':
+      return `${label} didn't pick up the call.`;
+    case 'busy':
+      return `${label}'s line was busy.`;
+    case 'failed':
+      return `Call failed to reach ${label}.`;
+    case 'canceled':
+      return `Call to ${label} was canceled.`;
+    default:
+      return 'Call finished.';
+  }
+}
+
 function buildRecapSmsBody(call) {
   const name = call.customer_name ? ` with ${call.customer_name}` : '';
-  const status = (call.status || call.twilio_status || 'completed').replace(/_/g, ' ');
+  const normalizedStatus = normalizeCallStatus(call.status || call.twilio_status || 'completed');
+  const status = normalizedStatus.replace(/_/g, ' ');
   const duration = call.duration ? ` Duration: ${formatDurationForSms(call.duration)}.` : '';
   const rawSummary = (call.call_summary || '').replace(/\s+/g, ' ').trim();
-  const summary = rawSummary ? rawSummary.slice(0, 180) : 'Call finished.';
+  const summary = normalizedStatus === 'completed'
+    ? (rawSummary ? rawSummary.slice(0, 180) : 'Call finished.')
+    : buildOutcomeSummary(call, normalizedStatus);
   return `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
+}
+
+function buildRetrySmsBody(callRecord, callState) {
+  const name = callState?.customer_name || callRecord?.customer_name;
+  const greeting = name ? `Hi ${name},` : 'Hi,';
+  return `${greeting} we tried to reach you by phone. When is a good time to call back?`;
 }
 
 const DIGIT_PROFILE_LABELS = {
@@ -804,7 +883,7 @@ async function ensureAwsSession(callSid) {
   gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
   const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
-  applyInitialDigitIntent(callSid, callConfig);
+  await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
 
   const session = {
     startTime: new Date(),
@@ -878,7 +957,7 @@ async function ensureAwsSession(callSid) {
         webhookService.recordTranscriptTurn(callSid, 'agent', firstMessage);
         webhookService.setLiveCallPhase(callSid, 'agent_speaking').catch(() => {});
         if (digitService?.hasExpectation(callSid)) {
-          digitService.markDigitPrompted(callSid);
+          digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
           digitService.scheduleDigitTimeout(callSid, gptService, 0);
         }
         scheduleSilenceTimer(callSid);
@@ -958,7 +1037,6 @@ app.ws('/connection', (ws, req) => {
     let functionSystem = null;
 
     let gptService;
-    let gptErrorCount = 0;
     const streamService = new StreamService(ws);
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
@@ -1029,13 +1107,14 @@ app.ws('/connection', (ws, req) => {
           const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
           gptService.setCallIntent(intentLine);
           if (callConfig) {
-            applyInitialDigitIntent(callSid, callConfig);
+            await applyInitialDigitIntent(callSid, callConfig, gptService, interactionCount);
           }
 
           let gptErrorCount = 0;
 
           // Set up GPT reply handler with personality tracking
           gptService.on('gptreply', async (gptReply, icount) => {
+            gptErrorCount = 0;
             const activeSession = activeCalls.get(callSid);
             if (activeSession?.ending) {
               return;
@@ -1153,7 +1232,7 @@ app.ws('/connection', (ws, req) => {
               callConfigurations.set(callSid, callConfig);
             }
             if (digitService?.hasExpectation(callSid)) {
-              digitService.markDigitPrompted(callSid);
+              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
@@ -1194,7 +1273,7 @@ app.ws('/connection', (ws, req) => {
               callConfigurations.set(callSid, callConfig);
             }
             if (digitService?.hasExpectation(callSid)) {
-              digitService.markDigitPrompted(callSid);
+              digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
@@ -1232,15 +1311,18 @@ app.ws('/connection', (ws, req) => {
             const expectation = digitService?.getExpectation(callSid);
             console.log(`Media DTMF for ${callSid}: "${digits}" (expectation ${expectation ? 'present' : 'missing'})`);
             if (!expectation) {
-              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored)`, { force: true });
+              if (digitService?.bufferDigits) {
+                digitService.bufferDigits(callSid, digits, { timestamp: Date.now(), source: 'dtmf', early: true });
+              }
+              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (buffered)`, { force: true });
               return;
             }
-            const delayMs = expectation.min_collect_delay_ms || 0;
-            if (!expectation.prompted_at || Date.now() - expectation.prompted_at < delayMs) {
-              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored early)`, { force: true });
+            await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+            if (!digitService?.hasExpectation(callSid)) {
               return;
             }
-            const display = expectation.profile === 'verification'
+            const activeExpectation = digitService.getExpectation(callSid);
+            const display = activeExpectation?.profile === 'verification'
               ? digitService.formatOtpForDisplay(digits, 'progress')
               : `Keypad: ${digits}`;
             webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
@@ -1354,17 +1436,21 @@ app.ws('/connection', (ws, req) => {
       }
       
       // Process with adaptive personality and functions
-      try {
-        await gptService.completion(otpContext.maskedForGpt, interactionCount);
-      } catch (gptError) {
-        console.error('GPT completion error:', gptError);
-        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-      }
-      interactionCount += 1;
-      const session = activeCalls.get(callSid);
-      if (session) {
-        session.interactionCount = interactionCount;
-      }
+      await enqueueGptTask(callSid, async () => {
+        const currentCount = interactionCount;
+        try {
+          await gptService.completion(otpContext.maskedForGpt, currentCount);
+        } catch (gptError) {
+          console.error('GPT completion error:', gptError);
+          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+        }
+        const nextCount = currentCount + 1;
+        interactionCount = nextCount;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = nextCount;
+        }
+      });
 
     });
     
@@ -1389,6 +1475,7 @@ app.ws('/connection', (ws, req) => {
       if (digitService) {
         digitService.clearCallState(callSid);
       }
+      clearGptQueue(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1399,7 +1486,7 @@ app.ws('/connection', (ws, req) => {
 });
 
 // Vonage websocket media handler (bidirectional PCM µ-law)
-app.ws('/vonage/stream', (ws, req) => {
+app.ws('/vonage/stream', async (ws, req) => {
   try {
     const callSid = req.query?.callSid;
     if (!callSid) {
@@ -1436,7 +1523,7 @@ app.ws('/vonage/stream', (ws, req) => {
     gptService.setCallProfile(callConfig?.purpose || callConfig?.business_context?.purpose);
     const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
-    applyInitialDigitIntent(callSid, callConfig);
+    await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
 
     activeCalls.set(callSid, {
       startTime: new Date(),
@@ -1451,6 +1538,7 @@ app.ws('/vonage/stream', (ws, req) => {
     });
 
     gptService.on('gptreply', async (gptReply, icount) => {
+      gptErrorCount = 0;
       const activeSession = activeCalls.get(callSid);
       if (activeSession?.ending) {
         return;
@@ -1571,17 +1659,21 @@ app.ws('/vonage/stream', (ws, req) => {
         }
         return;
       }
-      try {
-        await gptService.completion(otpContext.maskedForGpt, interactionCount);
-      } catch (gptError) {
-        console.error('GPT completion error:', gptError);
-        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-      }
-      interactionCount += 1;
-      const session = activeCalls.get(callSid);
-      if (session) {
-        session.interactionCount = interactionCount;
-      }
+      await enqueueGptTask(callSid, async () => {
+        const currentCount = interactionCount;
+        try {
+          await gptService.completion(otpContext.maskedForGpt, currentCount);
+        } catch (gptError) {
+          console.error('GPT completion error:', gptError);
+          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+        }
+        const nextCount = currentCount + 1;
+        interactionCount = nextCount;
+        const session = activeCalls.get(callSid);
+        if (session) {
+          session.interactionCount = nextCount;
+        }
+      });
 
     });
 
@@ -1611,6 +1703,7 @@ app.ws('/vonage/stream', (ws, req) => {
       if (digitService) {
         digitService.clearCallState(callSid);
       }
+      clearGptQueue(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1620,7 +1713,7 @@ app.ws('/vonage/stream', (ws, req) => {
       ttsService.generate({ partialResponseIndex: null, partialResponse: callConfig.first_message }, 0);
       webhookService.recordTranscriptTurn(callSid, 'agent', callConfig.first_message);
       if (digitService?.hasExpectation(callSid)) {
-        digitService.markDigitPrompted(callSid);
+        digitService.markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
         digitService.scheduleDigitTimeout(callSid, gptService, 0);
       }
       scheduleSilenceTimer(callSid);
@@ -1721,16 +1814,20 @@ app.ws('/aws/stream', (ws, req) => {
         return;
       }
 
-      try {
-        await session.gptService.completion(otpContext.maskedForGpt, interactionCount);
-      } catch (gptError) {
-        console.error('GPT completion error:', gptError);
-        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-      }
-      interactionCount += 1;
-      if (session) {
-        session.interactionCount = interactionCount;
-      }
+      await enqueueGptTask(callSid, async () => {
+        const currentCount = interactionCount;
+        try {
+          await session.gptService.completion(otpContext.maskedForGpt, currentCount);
+        } catch (gptError) {
+          console.error('GPT completion error:', gptError);
+          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+        }
+        const nextCount = currentCount + 1;
+        interactionCount = nextCount;
+        if (session) {
+          session.interactionCount = nextCount;
+        }
+      });
     });
 
     ws.on('message', (data) => {
@@ -1759,6 +1856,7 @@ app.ws('/aws/stream', (ws, req) => {
       if (digitService) {
         digitService.clearCallState(callSid);
       }
+      clearGptQueue(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1775,6 +1873,7 @@ async function handleCallEnd(callSid, callStartTime) {
   try {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
+    clearGptQueue(callSid);
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);
@@ -1976,10 +2075,80 @@ app.post('/webhook/telegram', async (req, res) => {
 
     const parts = cb.data.split(':');
     const prefix = parts[0];
-    const action = prefix === 'lc' ? parts[1] : null;
-    const callSid = prefix === 'lc' ? parts[2] : parts[1];
+    let action = null;
+    let callSid = null;
+    if (prefix === 'lc') {
+      action = parts[1];
+      callSid = parts[2];
+    } else if (prefix === 'recap' || prefix === 'retry') {
+      action = parts[1];
+      callSid = parts[2];
+    } else {
+      callSid = parts[1];
+    }
     if (!prefix || !callSid || (prefix === 'lc' && !action)) {
       webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
+      return;
+    }
+
+    if (prefix === 'retry') {
+      const retryAction = action;
+      try {
+        const callRecord = await db.getCall(callSid).catch(() => null);
+        const chatId = cb.message?.chat?.id;
+        if (!callRecord) {
+          webhookService.answerCallbackQuery(cb.id, 'Call not found').catch(() => {});
+          return;
+        }
+        if (callRecord.user_chat_id && chatId && String(callRecord.user_chat_id) !== String(chatId)) {
+          webhookService.answerCallbackQuery(cb.id, 'Not authorized for this call').catch(() => {});
+          return;
+        }
+
+        if (retryAction === 'sms') {
+          if (!callRecord?.phone_number) {
+            webhookService.answerCallbackQuery(cb.id, 'No phone number on record').catch(() => {});
+            return;
+          }
+          const callState = await db.getLatestCallState(callSid, 'call_created').catch(() => null);
+          const smsBody = buildRetrySmsBody(callRecord, callState);
+          try {
+            await smsService.sendSMS(callRecord.phone_number, smsBody);
+            webhookService.answerCallbackQuery(cb.id, 'SMS sent').catch(() => {});
+            await webhookService.sendTelegramMessage(chatId, '💬 Follow-up SMS sent to the customer.');
+          } catch (smsError) {
+            webhookService.answerCallbackQuery(cb.id, 'Failed to send SMS').catch(() => {});
+            await webhookService.sendTelegramMessage(chatId, `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`);
+          }
+          return;
+        }
+
+        const payload = await buildRetryPayload(callSid);
+        const delayMs = retryAction === '15m' ? 15 * 60 * 1000 : 0;
+        const host = config.server?.hostname;
+        if (!host) {
+          webhookService.answerCallbackQuery(cb.id, 'Server hostname not configured').catch(() => {});
+          return;
+        }
+
+        if (delayMs > 0) {
+          setTimeout(() => {
+            placeOutboundCall(payload, host).catch((err) => {
+              console.error('Scheduled retry failed:', err);
+            });
+          }, delayMs);
+          webhookService.answerCallbackQuery(cb.id, 'Retry scheduled').catch(() => {});
+          await webhookService.sendTelegramMessage(chatId, `⏲ Retry scheduled in 15 minutes for ${formatContactLabel(payload)}.`);
+          return;
+        }
+
+        const retryResult = await placeOutboundCall(payload, host);
+        webhookService.answerCallbackQuery(cb.id, 'Retry started').catch(() => {});
+        await webhookService.sendTelegramMessage(chatId, `🔁 Retry started for ${formatContactLabel(payload)} (call ${retryResult.callId.slice(-6)}).`);
+      } catch (error) {
+        webhookService.answerCallbackQuery(cb.id, 'Retry failed').catch(() => {});
+        await webhookService.sendTelegramMessage(cb.message?.chat?.id, `❌ Retry failed: ${error.message || error}`);
+      }
       return;
     }
 
@@ -2217,8 +2386,16 @@ app.post('/aws/transcripts', async (req, res) => {
       session.interactionCount += 1;
       return res.status(200).json({ success: true });
     }
-    session.gptService.completion(transcript, session.interactionCount);
-    session.interactionCount += 1;
+    enqueueGptTask(callSid, async () => {
+      const currentCount = session.interactionCount || 0;
+      try {
+        await session.gptService.completion(transcript, currentCount);
+      } catch (gptError) {
+        console.error('GPT completion error:', gptError);
+        webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+      }
+      session.interactionCount = currentCount + 1;
+    });
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('AWS transcript webhook error:', error);
@@ -2361,230 +2538,277 @@ app.post('/api/call-templates/:id/clone', async (req, res) => {
   }
 });
 
-// Enhanced outbound call endpoint with dynamic function generation
-app.post('/outbound-call', async (req, res) => {
+async function buildRetryPayload(callSid) {
+  const callRecord = await db.getCall(callSid);
+  if (!callRecord) {
+    throw new Error('Call not found');
+  }
+  const callState = await db.getLatestCallState(callSid, 'call_created').catch(() => null);
+
+  return {
+    number: callRecord.phone_number,
+    prompt: callRecord.prompt,
+    first_message: callRecord.first_message,
+    user_chat_id: callRecord.user_chat_id,
+    customer_name: callState?.customer_name || null,
+    business_id: callState?.business_id || null,
+    template: callState?.template || null,
+    template_id: callState?.template_id || null,
+    purpose: callState?.purpose || null,
+    emotion: callState?.emotion || null,
+    urgency: callState?.urgency || null,
+    technical_level: callState?.technical_level || null,
+    voice_model: callState?.voice_model || null,
+    collection_profile: callState?.collection_profile || null,
+    collection_expected_length: callState?.collection_expected_length || null,
+    collection_menu_options: callState?.collection_menu_options || [],
+    collection_timeout_s: callState?.collection_timeout_s || null,
+    collection_max_retries: callState?.collection_max_retries || null,
+    collection_mask_for_gpt: callState?.collection_mask_for_gpt,
+    collection_speak_confirmation: callState?.collection_speak_confirmation
+  };
+}
+
+async function placeOutboundCall(payload, hostOverride = null) {
+  const {
+    number,
+    prompt,
+    first_message,
+    user_chat_id,
+    customer_name,
+    business_id,
+    template,
+    template_id,
+    purpose,
+    emotion,
+    urgency,
+    technical_level,
+    voice_model,
+    collection_profile,
+    collection_expected_length,
+    collection_menu_options,
+    collection_timeout_s,
+    collection_max_retries,
+    collection_mask_for_gpt,
+    collection_speak_confirmation
+  } = payload || {};
+
+  if (!number || !prompt || !first_message) {
+    throw new Error('Missing required fields: number, prompt, and first_message are required');
+  }
+
+  if (!number.match(/^\+[1-9]\d{1,14}$/)) {
+    throw new Error('Invalid phone number format. Use E.164 format (e.g., +1234567890)');
+  }
+
+  const host = hostOverride || config.server?.hostname;
+  if (!host) {
+    throw new Error('Server hostname not configured');
+  }
+
+  console.log('Generating adaptive function system for call...'.blue);
+  const functionSystem = functionEngine.generateAdaptiveFunctionSystem(prompt, first_message);
+  console.log(`Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`);
+
+  let callId;
+  let callStatus = 'queued';
+  let providerMetadata = {};
+
+  if (currentProvider === 'twilio') {
+    const accountSid = config.twilio.accountSid;
+    const authToken = config.twilio.authToken;
+    const fromNumber = config.twilio.fromNumber;
+
+    if (!accountSid || !authToken || !fromNumber) {
+      throw new Error('Twilio credentials not configured');
+    }
+
+    const client = twilio(accountSid, authToken);
+    const twimlUrl = `https://${host}/incoming`;
+    const statusUrl = `https://${host}/webhook/call-status`;
+    console.log(`Twilio call URLs: twiml=${twimlUrl} statusCallback=${statusUrl}`);
+    const call = await client.calls.create({
+      url: twimlUrl,
+      to: number,
+      from: fromNumber,
+      statusCallback: statusUrl,
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
+      statusCallbackMethod: 'POST'
+    });
+    callId = call.sid;
+    callStatus = call.status || 'queued';
+  } else if (currentProvider === 'aws') {
+    const awsAdapter = getAwsConnectAdapter();
+    callId = uuidv4();
+    const response = await awsAdapter.startOutboundCall({
+      destinationPhoneNumber: number,
+      clientToken: callId,
+      attributes: {
+        CALL_SID: callId,
+        FIRST_MESSAGE: first_message
+      }
+    });
+    providerMetadata = { contact_id: response.ContactId };
+    if (response.ContactId) {
+      awsContactMap.set(response.ContactId, callId);
+    }
+    callStatus = 'queued';
+  } else if (currentProvider === 'vonage') {
+    const vonageAdapter = getVonageVoiceAdapter();
+    callId = uuidv4();
+    const answerUrl = config.vonage.voice.answerUrl ||
+      `https://${host}/webhook/vonage/answer?callSid=${callId}`;
+    const eventUrl = config.vonage.voice.eventUrl ||
+      `https://${host}/webhook/vonage/event?callSid=${callId}`;
+    const response = await vonageAdapter.createOutboundCall({
+      to: number,
+      callSid: callId,
+      answerUrl,
+      eventUrl
+    });
+    const vonageUuid = response?.uuid;
+    providerMetadata = { vonage_uuid: vonageUuid };
+    if (vonageUuid) {
+      vonageCallMap.set(vonageUuid, callId);
+    }
+    callStatus = response?.status || 'queued';
+  } else {
+    throw new Error(`Unsupported provider ${currentProvider}`);
+  }
+
+  let templatePolicy = {};
+  if (template_id) {
+    try {
+      const tpl = await db.getCallTemplateById(Number(template_id));
+      if (tpl) {
+        templatePolicy = {
+          requires_otp: !!tpl.requires_otp,
+          default_profile: tpl.default_profile || null,
+          expected_length: tpl.expected_length || null,
+          allow_terminator: !!tpl.allow_terminator,
+          terminator_char: tpl.terminator_char || null
+        };
+      }
+    } catch (err) {
+      console.error('Template metadata load error:', err);
+    }
+  }
+
+  const callConfig = {
+    prompt: prompt,
+    first_message: first_message,
+    created_at: new Date().toISOString(),
+    user_chat_id: user_chat_id,
+    customer_name: customer_name || null,
+    provider: currentProvider,
+    provider_metadata: providerMetadata,
+    business_context: functionSystem.context,
+    function_count: functionSystem.functions.length,
+    purpose: purpose || null,
+    business_id: business_id || null,
+    template: template || null,
+    template_id: template_id || null,
+    emotion: emotion || null,
+    urgency: urgency || null,
+    technical_level: technical_level || null,
+    voice_model: voice_model || null,
+    collection_profile: collection_profile || null,
+    collection_expected_length: collection_expected_length || null,
+    collection_menu_options: collection_menu_options || [],
+    collection_timeout_s: collection_timeout_s || null,
+    collection_max_retries: collection_max_retries || null,
+    collection_mask_for_gpt: collection_mask_for_gpt,
+    collection_speak_confirmation: collection_speak_confirmation,
+    template_policy: templatePolicy
+  };
+
+  callConfigurations.set(callId, callConfig);
+  callFunctionSystems.set(callId, functionSystem);
+
   try {
-    const {
-      number,
-      prompt,
-      first_message,
-      user_chat_id,
-      customer_name,
-      business_id,
-      template,
-      template_id,
-      purpose,
-      emotion,
-      urgency,
-      technical_level,
-      voice_model
-    } = req.body;
-
-    if (!number || !prompt || !first_message) {
-      return res.status(400).json({
-        error: 'Missing required fields: number, prompt, and first_message are required'
-      });
-    }
-
-    if (!number.match(/^\+[1-9]\d{1,14}$/)) {
-      return res.status(400).json({
-        error: 'Invalid phone number format. Use E.164 format (e.g., +1234567890)'
-      });
-    }
-
-    if (!config.server?.hostname) {
-      return res.status(500).json({
-        error: 'Server hostname not configured'
-      });
-    }
-
-    console.log('Generating adaptive function system for call...'.blue);
-    
-    // Generate dynamic functions based on the prompt
-    const functionSystem = functionEngine.generateAdaptiveFunctionSystem(prompt, first_message);
-    
-    console.log(`Generated ${functionSystem.functions.length} functions for ${functionSystem.context.industry} industry`);
-
-    let callId;
-    let callStatus = 'queued';
-    let providerMetadata = {};
-
-    if (currentProvider === 'twilio') {
-      const accountSid = config.twilio.accountSid;
-      const authToken = config.twilio.authToken;
-      const fromNumber = config.twilio.fromNumber;
-      const host = resolveHost(req) || config.server?.hostname;
-
-      if (!accountSid || !authToken || !fromNumber) {
-        return res.status(500).json({
-          error: 'Twilio credentials not configured'
-        });
-      }
-      if (!host) {
-        return res.status(500).json({ error: 'Server hostname not configured' });
-      }
-
-      const client = twilio(accountSid, authToken);
-      const twimlUrl = `https://${host}/incoming`;
-      const statusUrl = `https://${host}/webhook/call-status`;
-      console.log(`Twilio call URLs: twiml=${twimlUrl} statusCallback=${statusUrl}`);
-      const call = await client.calls.create({
-        url: twimlUrl,
-        to: number,
-        from: fromNumber,
-        statusCallback: statusUrl,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
-        statusCallbackMethod: 'POST'
-      });
-      callId = call.sid;
-      callStatus = call.status || 'queued';
-    } else if (currentProvider === 'aws') {
-      const awsAdapter = getAwsConnectAdapter();
-      callId = uuidv4();
-      const response = await awsAdapter.startOutboundCall({
-        destinationPhoneNumber: number,
-        clientToken: callId,
-        attributes: {
-          CALL_SID: callId,
-          FIRST_MESSAGE: first_message
-        }
-      });
-      providerMetadata = { contact_id: response.ContactId };
-      if (response.ContactId) {
-        awsContactMap.set(response.ContactId, callId);
-      }
-      callStatus = 'queued';
-    } else if (currentProvider === 'vonage') {
-      const vonageAdapter = getVonageVoiceAdapter();
-      callId = uuidv4();
-      const answerUrl = config.vonage.voice.answerUrl ||
-        `https://${config.server.hostname}/webhook/vonage/answer?callSid=${callId}`;
-      const eventUrl = config.vonage.voice.eventUrl ||
-        `https://${config.server.hostname}/webhook/vonage/event?callSid=${callId}`;
-      const response = await vonageAdapter.createOutboundCall({
-        to: number,
-        callSid: callId,
-        answerUrl,
-        eventUrl
-      });
-      const vonageUuid = response?.uuid;
-      providerMetadata = { vonage_uuid: vonageUuid };
-      if (vonageUuid) {
-        vonageCallMap.set(vonageUuid, callId);
-      }
-      callStatus = response?.status || 'queued';
-    } else {
-      return res.status(400).json({ error: `Unsupported provider ${currentProvider}` });
-    }
-
-    // Load template metadata to seed digit policy
-    let templatePolicy = {};
-    if (template_id) {
-      try {
-        const tpl = await db.getCallTemplateById(Number(template_id));
-        if (tpl) {
-          templatePolicy = {
-            requires_otp: !!tpl.requires_otp,
-            default_profile: tpl.default_profile || null,
-            expected_length: tpl.expected_length || null,
-            allow_terminator: !!tpl.allow_terminator,
-            terminator_char: tpl.terminator_char || null
-          };
-        }
-      } catch (err) {
-        console.error('Template metadata load error:', err);
-      }
-    }
-
-    const callConfig = {
+    await db.createCall({
+      call_sid: callId,
+      phone_number: number,
       prompt: prompt,
       first_message: first_message,
-      created_at: new Date().toISOString(),
       user_chat_id: user_chat_id,
+      business_context: JSON.stringify(functionSystem.context),
+      generated_functions: JSON.stringify(functionSystem.functions.map(f => f.function.name))
+    });
+    await db.updateCallState(callId, 'call_created', {
       customer_name: customer_name || null,
-      provider: currentProvider,
-      provider_metadata: providerMetadata,
-      business_context: functionSystem.context,
-      function_count: functionSystem.functions.length,
-      purpose: purpose || null,
       business_id: business_id || null,
       template: template || null,
       template_id: template_id || null,
+      purpose: purpose || null,
       emotion: emotion || null,
       urgency: urgency || null,
       technical_level: technical_level || null,
       voice_model: voice_model || null,
-      collection_profile: req.body?.collection_profile || null,
-      collection_expected_length: req.body?.collection_expected_length || null,
-      collection_menu_options: req.body?.collection_menu_options || [],
-      collection_timeout_s: req.body?.collection_timeout_s || null,
-      collection_max_retries: req.body?.collection_max_retries || null,
-      collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
-      collection_speak_confirmation: req.body?.collection_speak_confirmation,
-      template_policy: templatePolicy
-    };
-    
-    callConfigurations.set(callId, callConfig);
-    
-    // Store the generated function system for this call
-    callFunctionSystems.set(callId, functionSystem);
+      provider: currentProvider,
+      provider_metadata: providerMetadata,
+      collection_profile: collection_profile || null,
+      collection_expected_length: collection_expected_length || null,
+      collection_menu_options: collection_menu_options || [],
+      collection_timeout_s: collection_timeout_s || null,
+      collection_max_retries: collection_max_retries || null,
+      collection_mask_for_gpt: collection_mask_for_gpt,
+      collection_speak_confirmation: collection_speak_confirmation
+    });
 
-    // Save call to database with enhanced metadata
-    try {
-      await db.createCall({
-        call_sid: callId,
-        phone_number: number,
-        prompt: prompt,
-        first_message: first_message,
-        user_chat_id: user_chat_id,
-        business_context: JSON.stringify(functionSystem.context),
-        generated_functions: JSON.stringify(functionSystem.functions.map(f => f.function.name))
-      });
-      await db.updateCallState(callId, 'call_created', {
-        customer_name: customer_name || null,
-        business_id: business_id || null,
-        template: template || null,
-        template_id: template_id || null,
-        purpose: purpose || null,
-        emotion: emotion || null,
-        urgency: urgency || null,
-        technical_level: technical_level || null,
-        voice_model: voice_model || null,
-        provider: currentProvider,
-        provider_metadata: providerMetadata,
-        collection_profile: req.body?.collection_profile || null,
-        collection_expected_length: req.body?.collection_expected_length || null,
-        collection_menu_options: req.body?.collection_menu_options || [],
-        collection_timeout_s: req.body?.collection_timeout_s || null,
-        collection_max_retries: req.body?.collection_max_retries || null,
-        collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
-        collection_speak_confirmation: req.body?.collection_speak_confirmation
-      });
-
-      // Create initial webhook notification
-      if (user_chat_id) {
-        await db.createEnhancedWebhookNotification(callId, 'call_initiated', user_chat_id);
-      }
-
-      console.log(`Enhanced adaptive call created: ${callId} to ${number}`);
-      console.log(`Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`);
-      
-    } catch (dbError) {
-      console.error('Database error:', dbError);
+    if (user_chat_id) {
+      await db.createEnhancedWebhookNotification(callId, 'call_initiated', user_chat_id);
     }
+
+    console.log(`Enhanced adaptive call created: ${callId} to ${number}`);
+    console.log(`Business context: ${functionSystem.context.industry} - ${functionSystem.context.businessType}`);
+  } catch (dbError) {
+    console.error('Database error:', dbError);
+  }
+
+  return { callId, callStatus, functionSystem };
+}
+
+// Enhanced outbound call endpoint with dynamic function generation
+app.post('/outbound-call', async (req, res) => {
+  try {
+    const payload = {
+      number: req.body?.number,
+      prompt: req.body?.prompt,
+      first_message: req.body?.first_message,
+      user_chat_id: req.body?.user_chat_id,
+      customer_name: req.body?.customer_name,
+      business_id: req.body?.business_id,
+      template: req.body?.template,
+      template_id: req.body?.template_id,
+      purpose: req.body?.purpose,
+      emotion: req.body?.emotion,
+      urgency: req.body?.urgency,
+      technical_level: req.body?.technical_level,
+      voice_model: req.body?.voice_model,
+      collection_profile: req.body?.collection_profile,
+      collection_expected_length: req.body?.collection_expected_length,
+      collection_menu_options: req.body?.collection_menu_options || [],
+      collection_timeout_s: req.body?.collection_timeout_s,
+      collection_max_retries: req.body?.collection_max_retries,
+      collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
+      collection_speak_confirmation: req.body?.collection_speak_confirmation
+    };
+
+    const host = resolveHost(req) || config.server?.hostname;
+    const result = await placeOutboundCall(payload, host);
 
     res.json({
       success: true,
-      call_sid: callId,
-      to: number,
-      status: callStatus,
+      call_sid: result.callId,
+      to: payload.number,
+      status: result.callStatus,
       provider: currentProvider,
-      business_context: functionSystem.context,
-      generated_functions: functionSystem.functions.length,
-      function_types: functionSystem.functions.map(f => f.function.name),
+      business_context: result.functionSystem.context,
+      generated_functions: result.functionSystem.functions.length,
+      function_types: result.functionSystem.functions.map(f => f.function.name),
       enhanced_webhooks: true
     });
-
   } catch (error) {
     console.error('Error creating enhanced adaptive outbound call:', error);
     res.status(500).json({
@@ -2762,10 +2986,6 @@ app.post('/webhook/call-status', async (req, res) => {
         await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
         console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`);
 
-        if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus)) {
-          await db.createEnhancedWebhookNotification(CallSid, 'call_recap', call.user_chat_id);
-        }
-        
         // Log the correction if we changed the status
         if (actualStatus !== CallStatus.toLowerCase()) {
           await db.logServiceHealth('webhook_system', 'status_corrected', {

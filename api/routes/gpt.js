@@ -27,6 +27,8 @@ class EnhancedGptService extends EventEmitter {
     this.maxTokens = config.openRouter.maxTokens || 160;
     this.fillerText = 'One moment, checking now.';
     this.stallTimeoutMs = 2000;
+    this.responseTimeoutMs = config.openRouter.responseTimeoutMs || 25000;
+    this.streamIdleTimeoutMs = config.openRouter.streamIdleTimeoutMs || 8000;
     this.latencyHistory = [];
     this.maxLatencySamples = 8;
     this.brevityHint = 'Keep spoken replies concise: max 2 sentences, ~200 characters, and avoid rambling.';
@@ -317,12 +319,26 @@ class EnhancedGptService extends EventEmitter {
     const startedAt = Date.now();
     let firstChunkAt = null;
     let stallTimer = null;
+    let responseTimer = null;
+    let idleTimer = null;
+    let controller = null;
     let fillerSent = false;
-    const handleFailure = (err) => {
+    const clearTimers = () => {
       if (stallTimer) {
         clearTimeout(stallTimer);
         stallTimer = null;
       }
+      if (responseTimer) {
+        clearTimeout(responseTimer);
+        responseTimer = null;
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const handleFailure = (err) => {
+      clearTimers();
       console.error('GPT completion error:', err);
       this.emit('gpterror', err);
 
@@ -366,6 +382,11 @@ class EnhancedGptService extends EventEmitter {
           }
         }, this.stallTimeoutMs);
 
+        controller = new AbortController();
+        responseTimer = setTimeout(() => {
+          controller.abort(new Error('gpt_response_timeout'));
+        }, this.responseTimeoutMs);
+
         const effectiveMaxTokens = interactionCount > 0
           ? Math.min(adaptiveMaxTokens, Math.floor(this.maxTokens * 0.6))
           : adaptiveMaxTokens;
@@ -376,7 +397,11 @@ class EnhancedGptService extends EventEmitter {
           tools: toolsToUse,
           max_tokens: effectiveMaxTokens,
           stream: true,
+          signal: controller.signal,
         });
+        idleTimer = setTimeout(() => {
+          controller.abort(new Error('gpt_stream_idle'));
+        }, this.streamIdleTimeoutMs);
         break; // success
       } catch (err) {
         const retriable = (err?.status && err.status >= 500) || err?.code === 502;
@@ -388,10 +413,7 @@ class EnhancedGptService extends EventEmitter {
         if (canFallback && retriable) {
           currentModel = this.backupModel;
         }
-        if (stallTimer) {
-          clearTimeout(stallTimer);
-          stallTimer = null;
-        }
+        clearTimers();
         await new Promise((resolve) => setTimeout(resolve, 400));
       }
     }
@@ -425,6 +447,12 @@ class EnhancedGptService extends EventEmitter {
           firstChunkAt = Date.now();
           if (stallTimer) clearTimeout(stallTimer);
         }
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+        }
+        idleTimer = setTimeout(() => {
+          controller?.abort(new Error('gpt_stream_idle'));
+        }, this.streamIdleTimeoutMs);
         let content = chunk.choices[0]?.delta?.content || '';
         let deltas = chunk.choices[0].delta;
         finishReason = chunk.choices[0].finish_reason;
@@ -521,10 +549,7 @@ class EnhancedGptService extends EventEmitter {
     } catch (err) {
       streamError = err;
     } finally {
-      if (stallTimer) {
-        clearTimeout(stallTimer);
-        stallTimer = null;
-      }
+      clearTimers();
     }
 
     if (streamError) {

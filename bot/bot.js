@@ -243,6 +243,35 @@ function formatDuration(seconds = 0) {
     return `${minutes}:${String(remaining).padStart(2, '0')}`;
 }
 
+function normalizeCallStatus(value) {
+    return String(value || '').toLowerCase().replace(/_/g, '-');
+}
+
+function formatContactLabel(callData) {
+    if (callData?.customer_name) return callData.customer_name;
+    const digits = String(callData?.phone_number || '').replace(/\D/g, '');
+    if (digits.length >= 4) {
+        return `the contact ending ${digits.slice(-4)}`;
+    }
+    return 'the contact';
+}
+
+function buildOutcomeSummary(callData, status) {
+    const label = formatContactLabel(callData);
+    switch (status) {
+        case 'no-answer':
+            return `${label} didn't pick up the call.`;
+        case 'busy':
+            return `${label}'s line was busy.`;
+        case 'failed':
+            return `Call failed to reach ${label}.`;
+        case 'canceled':
+            return `Call to ${label} was canceled.`;
+        default:
+            return 'Call finished.';
+    }
+}
+
 function splitMessageIntoChunks(message = '', limit = 3500) {
     const lines = String(message || '').split('\n');
     const chunks = [];
@@ -692,10 +721,13 @@ bot.on('callback_query:data', async (ctx) => {
                         await ctx.reply('❌ Unable to send recap: phone number missing.');
                         return;
                     }
-                    const status = (callData.status || callData.twilio_status || 'completed').replace(/_/g, ' ');
+                    const normalizedStatus = normalizeCallStatus(callData.status || callData.twilio_status || 'completed');
+                    const status = normalizedStatus.replace(/_/g, ' ');
                     const duration = callData.duration ? ` Duration: ${formatDuration(callData.duration)}.` : '';
                     const summaryRaw = (callData.call_summary || '').replace(/\s+/g, ' ').trim();
-                    const summary = summaryRaw ? summaryRaw.slice(0, 180) : 'Call finished.';
+                    const summary = normalizedStatus === 'completed'
+                        ? (summaryRaw ? summaryRaw.slice(0, 180) : 'Call finished.')
+                        : buildOutcomeSummary(callData, normalizedStatus);
                     const name = callData.customer_name ? ` with ${callData.customer_name}` : '';
                     const message = `VoicedNut call recap${name}: ${summary} Status: ${status}.${duration}`;
                     await axios.post(`${config.apiUrl}/api/sms/send`, {
