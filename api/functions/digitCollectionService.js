@@ -198,6 +198,13 @@ function createDigitCollectionService(options = {}) {
     menu: { min_digits: 1, max_digits: 1, timeout_s: 8, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: false }
   };
 
+  function setCallDigitIntent(callSid, intent) {
+    const callConfig = callConfigurations.get(callSid);
+    if (!callConfig) return;
+    callConfig.digit_intent = intent;
+    callConfigurations.set(callSid, callConfig);
+  }
+
   function getDigitProfileDefaults(profile = 'generic') {
     const key = String(profile || 'generic').toLowerCase();
     return DIGIT_PROFILE_DEFAULTS[key] || {};
@@ -830,9 +837,12 @@ function createDigitCollectionService(options = {}) {
 
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
     const lower = String(text || '').toLowerCase();
-    const hasDigitWord = /\b(code|otp|pin|verification|passcode|password|one[-\s]?time)\b/.test(lower);
+    const hasDigitWord = /\b(code|otp|pin|verification|passcode|password|one[-\s]?time|digit|digits|number|numbers)\b/.test(lower);
     const hasPress = /\bpress\b/.test(lower);
+    const hasEnter = /\b(enter|input|key in|type|dial)\b/.test(lower);
+    const hasKeypad = /\b(keypad|touch[-\s]?tone|dtmf)\b/.test(lower);
     const hasOption = /\b(option|menu)\b/.test(lower);
+    const hasExplicitSignal = hasPress || hasEnter || hasKeypad;
     const sixMention = /\b6\b.*\bdigit/.test(lower) || /\bsix digit/.test(lower);
     const fourDigit = /\b4\b.*\bdigit/.test(lower) || /\bfour digit/.test(lower);
     const acctMention = /\b(account|policy|member|customer|reference|confirmation|tracking|case)\b/.test(lower);
@@ -841,7 +851,7 @@ function createDigitCollectionService(options = {}) {
       const m = lower.match(match);
       return m ? parseInt(m[1], 10) : null;
     };
-    const digitLen = numberHint(/\b(\d{4,8})\b/);
+    const digitLen = (hasDigitWord || hasKeypad) ? numberHint(/\b(\d{4,8})\b/) : null;
     const tpl = callConfig.template_policy || {};
 
     if (tpl.requires_otp) {
@@ -878,6 +888,10 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
+    if (!hasExplicitSignal) {
+      return null;
+    }
+
     if (hasDigitWord || sixMention || pinMention) {
       return {
         profile: 'verification',
@@ -909,7 +923,7 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
-    if (acctMention || digitLen) {
+    if ((acctMention && hasDigitWord) || digitLen) {
       const len = digitLen || (fourDigit ? 4 : 8);
       return {
         profile: 'account',
@@ -959,26 +973,6 @@ function createDigitCollectionService(options = {}) {
     return { mode: 'normal', reason: 'no_signal', confidence: 0 };
   }
 
-  async function recordFirstTurnDecision(callSid, decision) {
-    if (!db) return;
-    if (!decision) {
-      db.updateCallState(callSid, 'first_turn_decision', {
-        decided: false,
-        confidence: 0,
-        reason: 'no_signal'
-      }).catch(() => {});
-      return;
-    }
-    db.updateCallState(callSid, 'first_turn_decision', {
-      decided: true,
-      profile: decision.profile,
-      min_digits: decision.min_digits,
-      max_digits: decision.max_digits,
-      confidence: decision.confidence || 0.6,
-      reason: decision.reason || 'rule_match'
-    }).catch(() => {});
-  }
-
   function prepareInitialExpectation(callSid, callConfig = {}) {
     const intent = determineDigitIntent(callConfig);
     if (intent.mode !== 'dtmf' || !intent.expectation) {
@@ -992,50 +986,6 @@ function createDigitCollectionService(options = {}) {
     payload.reason = intent.reason || 'initial_intent';
     digitCollectionManager.setExpectation(callSid, payload);
     return { intent, expectation: payload };
-  }
-
-  async function maybeStartFirstTurnCollection(callSid, callConfig, gptService, interactionCount, rawText) {
-    if (!callConfig || callConfig.first_turn_decided) {
-      return null;
-    }
-    if (interactionCount !== 1) {
-      return null;
-    }
-    const decision = inferDigitExpectationFromText(rawText, callConfig);
-    callConfig.first_turn_decided = true;
-    callConfigurations.set(callSid, callConfig);
-    if (!decision) {
-      await recordFirstTurnDecision(callSid, null);
-      return null;
-    }
-    const payload = normalizeDigitExpectation({
-      ...decision,
-      prompt: '',
-      prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
-    });
-    payload.reason = decision.reason || 'first_turn';
-    digitCollectionManager.setExpectation(callSid, payload);
-    if (typeof clearSilenceTimer === 'function') {
-      clearSilenceTimer(callSid);
-    }
-    if (gptService) {
-      scheduleDigitTimeout(callSid, gptService, interactionCount);
-    }
-    const instruction = callConfig.first_message || callConfig.prompt || (payload.min_digits === payload.max_digits
-      ? `Please enter the ${payload.min_digits} digit code on your keypad now.`
-      : `Please enter between ${payload.min_digits} and ${payload.max_digits} digits on your keypad now.`);
-    webhookService.addLiveEvent(callSid, `🔢 First-turn digit collection started (${payload.profile})`, { force: true });
-    if (gptService) {
-      gptService.emit('gptreply', {
-        partialResponseIndex: null,
-        partialResponse: instruction,
-        personalityInfo: gptService.personalityEngine?.getCurrentPersonality() || {},
-        adaptationHistory: gptService.personalityChanges?.slice(-3) || []
-      }, interactionCount);
-      markDigitPrompted(callSid);
-    }
-    await recordFirstTurnDecision(callSid, { ...decision, confidence: decision.confidence || 0.8 });
-    return payload;
   }
 
   async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
@@ -1089,6 +1039,7 @@ function createDigitCollectionService(options = {}) {
     if (digitCollectionPlans.has(callSid)) {
       clearDigitPlan(callSid);
     }
+    setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_request', confidence: 1 });
     const callConfig = callConfigurations.get(callSid);
     const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
@@ -1130,6 +1081,7 @@ function createDigitCollectionService(options = {}) {
     if (digitCollectionPlans.has(callSid)) {
       clearDigitPlan(callSid);
     }
+    setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_plan', confidence: 1 });
     digitCollectionManager.expectations.delete(callSid);
     clearDigitTimeout(callSid);
     clearDigitFallbackState(callSid);
@@ -1407,7 +1359,6 @@ function createDigitCollectionService(options = {}) {
     inferDigitExpectationFromText,
     markDigitPrompted,
     maskOtpForExternal,
-    maybeStartFirstTurnCollection,
     normalizeDigitExpectation,
     prepareInitialExpectation,
     recordDigits: (callSid, digits, meta) => digitCollectionManager.recordDigits(callSid, digits, meta),

