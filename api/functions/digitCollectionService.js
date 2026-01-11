@@ -1015,6 +1015,30 @@ function createDigitCollectionService(options = {}) {
     };
   }
 
+  function resolveLockedExpectation(callConfig = {}) {
+    if (!callConfig) return null;
+    const fromConfig = buildExpectationFromConfig(callConfig);
+    if (fromConfig?.profile) {
+      return normalizeDigitExpectation({ ...fromConfig, prompt: '' });
+    }
+    const fromIntent = callConfig?.digit_intent?.expectation;
+    if (fromIntent?.profile) {
+      return normalizeDigitExpectation({ ...fromIntent, prompt: fromIntent.prompt || '' });
+    }
+    const tpl = callConfig.template_policy || {};
+    if (tpl.requires_otp) {
+      const len = tpl.expected_length || otpLength;
+      return normalizeDigitExpectation({
+        profile: tpl.default_profile || 'verification',
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: ''
+      });
+    }
+    return null;
+  }
+
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
     const lower = String(text || '').toLowerCase();
     const tpl = callConfig.template_policy || {};
@@ -1252,6 +1276,37 @@ function createDigitCollectionService(options = {}) {
     }
     setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_request', confidence: 1 });
     const callConfig = callConfigurations.get(callSid);
+    const lockedExpectation = resolveLockedExpectation(callConfig);
+    if (lockedExpectation?.profile) {
+      const requestedProfile = args.profile ? String(args.profile).toLowerCase() : null;
+      if (requestedProfile && requestedProfile !== lockedExpectation.profile) {
+        logger.warn(`Digit profile override: ${requestedProfile} -> ${lockedExpectation.profile}`);
+        webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile}`, { force: true });
+      }
+      args = {
+        ...args,
+        profile: lockedExpectation.profile
+      };
+      if (typeof args.min_digits !== 'number' && typeof lockedExpectation.min_digits === 'number') {
+        args.min_digits = lockedExpectation.min_digits;
+      }
+      if (typeof args.max_digits !== 'number' && typeof lockedExpectation.max_digits === 'number') {
+        args.max_digits = lockedExpectation.max_digits;
+      }
+      if (lockedExpectation.force_exact_length) {
+        args.min_digits = lockedExpectation.force_exact_length;
+        args.max_digits = lockedExpectation.force_exact_length;
+      }
+      if (typeof args.end_call_on_success !== 'boolean' && typeof lockedExpectation.end_call_on_success === 'boolean') {
+        args.end_call_on_success = lockedExpectation.end_call_on_success;
+      }
+      if (typeof args.allow_terminator !== 'boolean' && typeof lockedExpectation.allow_terminator === 'boolean') {
+        args.allow_terminator = lockedExpectation.allow_terminator;
+      }
+      if (!args.terminator_char && lockedExpectation.terminator_char) {
+        args.terminator_char = lockedExpectation.terminator_char;
+      }
+    }
     const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
       .join(' ');
@@ -1299,6 +1354,19 @@ function createDigitCollectionService(options = {}) {
     digitCollectionManager.expectations.delete(callSid);
     clearDigitTimeout(callSid);
     clearDigitFallbackState(callSid);
+
+    const callConfig = callConfigurations.get(callSid);
+    const lockedExpectation = resolveLockedExpectation(callConfig);
+    if (lockedExpectation?.profile) {
+      const mismatched = steps.some((step) => step.profile && String(step.profile).toLowerCase() !== lockedExpectation.profile);
+      if (mismatched || steps.length > 1) {
+        webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile} (plan rejected)`, { force: true });
+        return { error: 'profile_locked', expected: lockedExpectation.profile };
+      }
+      if (steps.length === 1 && !steps[0].profile) {
+        steps[0].profile = lockedExpectation.profile;
+      }
+    }
 
     const lastStep = steps[steps.length - 1] || {};
     const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
