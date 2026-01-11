@@ -270,6 +270,10 @@ function createDigitCollectionService(options = {}) {
     callConfigurations.set(callSid, callConfig);
   }
 
+  function clearDigitIntent(callSid, reason = 'digits_captured') {
+    setCallDigitIntent(callSid, { mode: 'normal', reason, confidence: 1 });
+  }
+
   function getDigitProfileDefaults(profile = 'generic') {
     const key = String(profile || 'generic').toLowerCase();
     return DIGIT_PROFILE_DEFAULTS[key] || {};
@@ -1047,13 +1051,17 @@ function createDigitCollectionService(options = {}) {
       const m = lower.match(re);
       return m ? parseInt(m[1], 10) : null;
     };
-    const hasOtpSignals = contains(/\b(otp|one[-\s]?time|verification|verify|code|passcode|pin|password)\b/);
-    const hasDigitsWord = contains(/\bdigit(s)?\b/);
     const hasPress = contains(/\bpress\b/);
     const hasEnter = contains(/\b(enter|input|key in|type|dial)\b/);
     const hasMenu = contains(/\b(option|menu)\b/);
     const explicitLen = numberHint(/\b(\d{4,8})\b/);
-    const explicitCommand = hasPress || hasEnter || hasMenu;
+    const explicitCommand = hasPress || hasEnter;
+    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|passcode|pin|password)\b/);
+    const hasOtpDeliveryPhrase = contains(/\b(text message code|sms code|texted code)\b/);
+    const hasCodeSignals = contains(/\b(code|security code|auth(?:entication)? code)\b/);
+    const hasOtpDelivery = contains(/\b(text message|sms|texted)\b/);
+    const hasDigitWord = contains(/\bdigit(s)?\b/);
+    const hasOtpDeliveryDigits = hasOtpDelivery && (hasDigitWord || explicitLen);
 
     if (tpl.requires_otp) {
       const len = tpl.expected_length || otpLength;
@@ -1089,8 +1097,41 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
-    // Priority 1: OTP / verification only when explicit OTP signals are present
-    if (hasOtpSignals || hasDigitsWord) {
+    // Specific deterministic profiles (requires action verb)
+    const specificExpectation = (() => {
+      if (contains(/\brouting number\b/)) return { profile: 'routing_number', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'routing_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(bank account|account number)\b/)) return { profile: 'bank_account', min_digits: 6, max_digits: 17, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'bank_account_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(ssn|social security)\b/)) return { profile: 'ssn', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.8, reason: 'ssn_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(date of birth|dob|birth date)\b/)) return { profile: 'dob', min_digits: 6, max_digits: 8, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'dob_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(phone number|callback number|call back number)\b/)) return { profile: 'phone', min_digits: 10, max_digits: 10, force_exact_length: 10, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'phone_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(member id|member number)\b/)) return { profile: 'member_id', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'member_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(tax id|tax identification|tin)\b/)) return { profile: 'tax_id', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'tax_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(ein|employer identification)\b/)) return { profile: 'ein', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'ein_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(policy number)\b/)) return { profile: 'policy_number', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'policy_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(invoice number|invoice)\b/)) return { profile: 'invoice_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'invoice_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(confirmation code|confirmation number)\b/)) return { profile: 'confirmation_code', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'confirmation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(claim number|claim)\b/)) return { profile: 'claim_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'claim_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(order number|order id|order)\b/)) return { profile: 'order_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'order_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(reservation number|reservation)\b/)) return { profile: 'reservation_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'reservation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(ticket number|ticket id|ticket)\b/)) return { profile: 'ticket_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'ticket_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      if (contains(/\b(case number|case id|case)\b/)) return { profile: 'case_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'case_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
+      return null;
+    })();
+
+    if (specificExpectation) {
+      if (!explicitCommand) {
+        return null;
+      }
+      return specificExpectation;
+    }
+
+    // OTP / verification only when explicit OTP signals are present
+    const hasOtpSignals = hasStrongOtpSignals
+      || hasOtpDeliveryPhrase
+      || (hasCodeSignals && explicitCommand)
+      || (hasOtpDeliveryDigits && explicitCommand);
+
+    if (hasOtpSignals) {
       const len = explicitLen || otpLength;
       return {
         profile: 'verification',
@@ -1112,7 +1153,7 @@ function createDigitCollectionService(options = {}) {
       return null;
     }
 
-    // Priority 2: menu (requires menu + command)
+    // Priority 3: menu (requires menu + command)
     if (hasMenu && (hasPress || hasEnter)) {
       return {
         profile: 'menu',
@@ -1128,24 +1169,6 @@ function createDigitCollectionService(options = {}) {
         terminator_char: tpl.terminator_char || '#'
       };
     }
-
-    // Priority 3: specific deterministic profiles (only when OTP not signaled)
-    if (contains(/\brouting number\b/)) return { profile: 'routing_number', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'routing_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(bank account|account number)\b/)) return { profile: 'bank_account', min_digits: 6, max_digits: 17, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'bank_account_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(ssn|social security)\b/)) return { profile: 'ssn', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.8, reason: 'ssn_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(date of birth|dob|birth date)\b/)) return { profile: 'dob', min_digits: 6, max_digits: 8, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'dob_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(phone number|callback number|call back number)\b/)) return { profile: 'phone', min_digits: 10, max_digits: 10, force_exact_length: 10, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'phone_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(member id|member number)\b/)) return { profile: 'member_id', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'member_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(tax id|tax identification|tin)\b/)) return { profile: 'tax_id', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'tax_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(ein|employer identification)\b/)) return { profile: 'ein', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'ein_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(policy number)\b/)) return { profile: 'policy_number', min_digits: 6, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'policy_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(invoice number|invoice)\b/)) return { profile: 'invoice_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'invoice_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(confirmation code|confirmation number)\b/)) return { profile: 'confirmation_code', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'confirmation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(claim number|claim)\b/)) return { profile: 'claim_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'claim_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(order number|order id|order)\b/)) return { profile: 'order_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'order_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(reservation number|reservation)\b/)) return { profile: 'reservation_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'reservation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(ticket number|ticket id|ticket)\b/)) return { profile: 'ticket_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'ticket_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-    if (contains(/\b(case number|case id|case)\b/)) return { profile: 'case_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'case_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
 
     // Priority 4: generic account (only when account+number present)
     if (contains(/\b(account|customer|member)\b/) && contains(/\bnumber\b/)) {
@@ -1687,6 +1710,7 @@ function createDigitCollectionService(options = {}) {
             completed_at: new Date().toISOString()
           }).catch(() => {});
           const planShouldEnd = allowCallEnd && plan.end_call_on_success !== false;
+          clearDigitIntent(callSid, 'digit_plan_completed');
           if (planShouldEnd) {
             const completionMessage = plan.completion_message || closingMessage;
             await speakAndEndCall(callSid, completionMessage, 'digits_collected_plan');
@@ -1700,6 +1724,7 @@ function createDigitCollectionService(options = {}) {
         }
       }
 
+      clearDigitIntent(callSid);
       if (shouldEndCall) {
         await speakAndEndCall(
           callSid,
