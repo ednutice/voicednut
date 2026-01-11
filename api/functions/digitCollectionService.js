@@ -1242,6 +1242,81 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
+    if (/\b(claim number|claim)\b/.test(lower)) {
+      return {
+        profile: 'claim_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'claim_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(order number|order id|order)\b/.test(lower)) {
+      return {
+        profile: 'order_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'order_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(reservation number|reservation)\b/.test(lower)) {
+      return {
+        profile: 'reservation_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'reservation_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(ticket number|ticket id|ticket)\b/.test(lower)) {
+      return {
+        profile: 'ticket_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'ticket_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(case number|case id|case)\b/.test(lower)) {
+      return {
+        profile: 'case_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'case_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
     if (hasDigitWord || sixMention || pinMention) {
       return {
         profile: 'verification',
@@ -1893,77 +1968,3 @@ function createDigitCollectionService(options = {}) {
 module.exports = {
   createDigitCollectionService
 };
-    if (/\b(claim number|claim)\b/.test(lower)) {
-      return {
-        profile: 'claim_number',
-        min_digits: 4,
-        max_digits: 12,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.6,
-        reason: 'claim_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
-
-    if (/\b(order number|order id|order)\b/.test(lower)) {
-      return {
-        profile: 'order_number',
-        min_digits: 4,
-        max_digits: 12,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.6,
-        reason: 'order_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
-
-    if (/\b(reservation number|reservation)\b/.test(lower)) {
-      return {
-        profile: 'reservation_number',
-        min_digits: 4,
-        max_digits: 12,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.6,
-        reason: 'reservation_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
-
-    if (/\b(ticket number|ticket id|ticket)\b/.test(lower)) {
-      return {
-        profile: 'ticket_number',
-        min_digits: 4,
-        max_digits: 12,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.6,
-        reason: 'ticket_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
-
-    if (/\b(case number|case id|case)\b/.test(lower)) {
-      return {
-        profile: 'case_number',
-        min_digits: 4,
-        max_digits: 12,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.6,
-        reason: 'case_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
-    }
