@@ -426,6 +426,10 @@ This project is licensed under the MIT License - see the <LICENSE> file for deta
 - [Grammy](https://grammy.dev/) for Telegram bot framework
 - All contributors who helped build this project
 
+## 📮 Voicemail QA
+
+See `docs/voicemail-qa.md` for a quick checklist and sample webhook payloads to validate voicemail detection behavior.
+
 ## 📊 Project Status
 
 - ✅ **Stable**: Core functionality working

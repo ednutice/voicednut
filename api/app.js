@@ -298,6 +298,9 @@ const callEndLocks = new Map();
 const silenceTimers = new Map();
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
 const gptQueues = new Map();
+const normalFlowBuffers = new Map();
+const normalFlowProcessing = new Set();
+const normalFlowLastInput = new Map();
 
 function enqueueGptTask(callSid, task) {
   if (!callSid || typeof task !== 'function') {
@@ -321,6 +324,62 @@ function enqueueGptTask(callSid, task) {
 function clearGptQueue(callSid) {
   if (callSid) {
     gptQueues.delete(callSid);
+  }
+}
+
+function clearNormalFlowState(callSid) {
+  if (!callSid) return;
+  normalFlowBuffers.delete(callSid);
+  normalFlowProcessing.delete(callSid);
+  normalFlowLastInput.delete(callSid);
+}
+
+function shouldSkipNormalInput(callSid, text, windowMs = 2000) {
+  const cleaned = String(text || '').trim();
+  if (!cleaned) return true;
+  const last = normalFlowLastInput.get(callSid);
+  const now = Date.now();
+  if (last && last.text === cleaned && now - last.at < windowMs) {
+    return true;
+  }
+  normalFlowLastInput.set(callSid, { text: cleaned, at: now });
+  return false;
+}
+
+async function processNormalFlowTranscript(callSid, text, gptService, getInteractionCount, setInteractionCount) {
+  if (!callSid || !gptService) return;
+  const cleaned = String(text || '').trim();
+  if (!cleaned) return;
+  if (shouldSkipNormalInput(callSid, cleaned)) return;
+
+  normalFlowBuffers.set(callSid, { text: cleaned, at: Date.now() });
+  if (normalFlowProcessing.has(callSid)) {
+    return;
+  }
+  normalFlowProcessing.add(callSid);
+  try {
+    while (normalFlowBuffers.has(callSid)) {
+      const next = normalFlowBuffers.get(callSid);
+      normalFlowBuffers.delete(callSid);
+      await enqueueGptTask(callSid, async () => {
+        if (callEndLocks.has(callSid)) return;
+        const session = activeCalls.get(callSid);
+        if (session?.ending) return;
+        const currentCount = typeof getInteractionCount === 'function' ? getInteractionCount() : 0;
+        try {
+          await gptService.completion(next.text, currentCount);
+        } catch (gptError) {
+          console.error('GPT completion error:', gptError);
+          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+        }
+        const nextCount = currentCount + 1;
+        if (typeof setInteractionCount === 'function') {
+          setInteractionCount(nextCount);
+        }
+      });
+    }
+  } finally {
+    normalFlowProcessing.delete(callSid);
   }
 }
 
@@ -391,14 +450,17 @@ const telephonyTools = [
           prompt: { type: 'string', description: 'Short instruction to the caller.' },
           min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
           max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
-          profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
+          profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'bank_account', 'phone', 'member_id', 'policy_number', 'invoice_number', 'confirmation_code', 'tax_id', 'ein', 'claim_number', 'order_number', 'reservation_number', 'ticket_number', 'case_number', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
           menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
           confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
           timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
           max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
+          end_call_on_success: { type: 'boolean', description: 'If false, keep the call active after digits are captured.' },
           allow_spoken_fallback: { type: 'boolean', description: 'If true, allow spoken fallback after keypad timeout.' },
           mask_for_gpt: { type: 'boolean', description: 'If true (default), mask digits before sending to GPT/transcripts.' },
-          speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' }
+          speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' },
+          allow_terminator: { type: 'boolean', description: 'If true, allow a terminator key (default #) to finish early.' },
+          terminator_char: { type: 'string', description: 'Single key used to end entry when allow_terminator is true.' }
         },
         required: ['prompt', 'min_digits', 'max_digits']
       }
@@ -421,18 +483,23 @@ const telephonyTools = [
                 prompt: { type: 'string', description: 'Short instruction to the caller.' },
                 min_digits: { type: 'integer', description: 'Minimum digits expected.', minimum: 1 },
                 max_digits: { type: 'integer', description: 'Maximum digits expected.', minimum: 1 },
-                profile: { type: 'string', enum: ['generic', 'verification', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
+                profile: { type: 'string', enum: ['generic', 'verification', 'ssn', 'dob', 'routing_number', 'bank_account', 'phone', 'member_id', 'policy_number', 'invoice_number', 'confirmation_code', 'tax_id', 'ein', 'claim_number', 'order_number', 'reservation_number', 'ticket_number', 'case_number', 'menu', 'account', 'extension', 'zip', 'amount', 'survey', 'callback_confirm', 'card_number', 'cvv', 'card_expiry'], description: 'Collection profile for downstream handling.' },
                 menu_options: { type: 'array', description: 'For menu profile, array of {digit,label,route}.', items: { type: 'object', properties: { digit: { type: 'string' }, label: { type: 'string' }, route: { type: 'string' } } } },
                 confirmation_style: { type: 'string', enum: ['none', 'last4', 'spoken_amount'], description: 'How to confirm receipt (masked, spoken summary only).' },
                 timeout_s: { type: 'integer', description: 'Timeout in seconds before reprompt.', minimum: 3 },
                 max_retries: { type: 'integer', description: 'Number of retries before fallback.', minimum: 0 },
                 allow_spoken_fallback: { type: 'boolean', description: 'If true, allow spoken fallback after keypad timeout.' },
                 mask_for_gpt: { type: 'boolean', description: 'If true (default), mask digits before sending to GPT/transcripts.' },
-                speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' }
+                speak_confirmation: { type: 'boolean', description: 'If true, GPT can verbally confirm receipt (without echoing digits).' },
+                allow_terminator: { type: 'boolean', description: 'If true, allow a terminator key (default #) to finish early.' },
+                terminator_char: { type: 'string', description: 'Single key used to end entry when allow_terminator is true.' },
+                end_call_on_success: { type: 'boolean', description: 'If false, keep the call active after this step.' }
               },
               required: ['profile']
             }
-          }
+          },
+          end_call_on_success: { type: 'boolean', description: 'If false, keep the call active after all steps are captured.' },
+          completion_message: { type: 'string', description: 'Optional message to speak after the final step when not ending the call.' }
         },
         required: ['steps']
       }
@@ -509,10 +576,59 @@ function buildTelephonyImplementations(callSid, gptService = null) {
   };
 }
 
-function applyTelephonyTools(gptService, callSid, baseTools = [], baseImpl = {}) {
-  const combinedTools = [...baseTools, ...telephonyTools];
+function applyTelephonyTools(gptService, callSid, baseTools = [], baseImpl = {}, options = {}) {
+  const allowTransfer = options.allowTransfer !== false;
+  const allowDigitCollection = options.allowDigitCollection !== false;
+  const normalizedName = (tool) => String(tool?.function?.name || '').trim().toLowerCase();
+
+  const filteredBaseTools = (Array.isArray(baseTools) ? baseTools : []).filter((tool) => {
+    const name = normalizedName(tool);
+    if (!name) return false;
+    if (!allowTransfer && (name === 'route_to_agent' || name === 'transfercall')) return false;
+    if (!allowDigitCollection && (name === 'collect_digits' || name === 'collect_multiple_digits')) return false;
+    return true;
+  });
+
+  const filteredTelephonyTools = telephonyTools.filter((tool) => {
+    const name = normalizedName(tool);
+    if (!allowTransfer && name === 'route_to_agent') return false;
+    if (!allowDigitCollection && (name === 'collect_digits' || name === 'collect_multiple_digits')) return false;
+    return true;
+  });
+
+  const combinedTools = [...filteredBaseTools, ...filteredTelephonyTools];
   const combinedImpl = { ...baseImpl, ...buildTelephonyImplementations(callSid, gptService) };
+  if (!allowTransfer) {
+    delete combinedImpl.route_to_agent;
+    delete combinedImpl.transferCall;
+    delete combinedImpl.transfercall;
+  }
+  if (!allowDigitCollection) {
+    delete combinedImpl.collect_digits;
+    delete combinedImpl.collect_multiple_digits;
+  }
   gptService.setDynamicFunctions(combinedTools, combinedImpl);
+}
+
+function getCallToolOptions(callConfig = {}) {
+  const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
+  return {
+    allowTransfer: isDigitIntent,
+    allowDigitCollection: isDigitIntent
+  };
+}
+
+function configureCallTools(gptService, callSid, callConfig, functionSystem) {
+  if (!gptService) return;
+  const baseTools = functionSystem?.functions || [];
+  const baseImpl = functionSystem?.implementations || {};
+  const options = getCallToolOptions(callConfig);
+  applyTelephonyTools(gptService, callSid, baseTools, baseImpl, options);
+  if (!options.allowTransfer && callConfig && !callConfig.no_transfer_note_added) {
+    gptService.setCallIntent('Constraint: do not transfer or escalate this call. Stay on the line and handle the customer end-to-end.');
+    callConfig.no_transfer_note_added = true;
+    callConfigurations.set(callSid, callConfig);
+  }
 }
 
 function formatDurationForSms(seconds) {
@@ -575,6 +691,22 @@ function buildRetrySmsBody(callRecord, callState) {
 const DIGIT_PROFILE_LABELS = {
   verification: 'OTP',
   otp: 'OTP',
+  ssn: 'SSN',
+  dob: 'DOB',
+  routing_number: 'Routing',
+  bank_account: 'Bank Acct',
+  phone: 'Phone',
+  member_id: 'Member ID',
+  policy_number: 'Policy',
+  invoice_number: 'Invoice',
+  confirmation_code: 'Confirm',
+  tax_id: 'Tax ID',
+  ein: 'EIN',
+  claim_number: 'Claim',
+  order_number: 'Order',
+  reservation_number: 'Reservation',
+  ticket_number: 'Ticket',
+  case_number: 'Case',
   account: 'Account',
   zip: 'ZIP',
   extension: 'Ext',
@@ -690,6 +822,23 @@ function getProviderReadiness() {
     aws: !!(config.aws.connect.instanceId && config.aws.connect.contactFlowId),
     vonage: !!(config.vonage.apiKey && config.vonage.apiSecret && config.vonage.applicationId && config.vonage.privateKey)
   };
+}
+
+let warnedMachineDetection = false;
+function isMachineDetectionEnabled() {
+  const value = String(config.twilio?.machineDetection || '').toLowerCase();
+  if (!value) return false;
+  if (['disable', 'disabled', 'off', 'false', '0', 'none'].includes(value)) return false;
+  return true;
+}
+
+function warnIfMachineDetectionDisabled(context = '') {
+  if (warnedMachineDetection) return;
+  if (currentProvider !== 'twilio') return;
+  if (isMachineDetectionEnabled()) return;
+  const suffix = context ? ` (${context})` : '';
+  console.warn(`⚠️ Twilio AMD is not enabled${suffix}. Voicemail detection may be unreliable. Set TWILIO_MACHINE_DETECTION=Enable.`);
+  warnedMachineDetection = true;
 }
 
 function getAwsConnectAdapter() {
@@ -872,10 +1021,8 @@ async function ensureAwsSession(callSid) {
   let gptService;
   if (functionSystem) {
     gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
-    applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
   } else {
     gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
-    applyTelephonyTools(gptService, callSid);
   }
 
   gptService.setCallSid(callSid);
@@ -884,6 +1031,7 @@ async function ensureAwsSession(callSid) {
   const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
   gptService.setCallIntent(intentLine);
   await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
+  configureCallTools(gptService, callSid, callConfig, functionSystem);
 
   const session = {
     startTime: new Date(),
@@ -972,6 +1120,7 @@ async function ensureAwsSession(callSid) {
 async function startServer() {
   try {
     console.log('🚀 Initializing Adaptive AI Call System...');
+    warnIfMachineDetectionDisabled('startup');
 
     // Initialize database first
     console.log('Initializing enhanced database...');
@@ -1091,14 +1240,10 @@ app.ws('/connection', (ws, req) => {
           if (callConfig && functionSystem) {
             console.log(`Using adaptive configuration for ${functionSystem.context.industry} industry`);
             console.log(`Available functions: ${Object.keys(functionSystem.implementations).join(', ')}`);
-            
             gptService = new EnhancedGptService(callConfig.prompt, callConfig.first_message);
-            applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
-            
           } else {
             console.log(`Standard call detected: ${callSid}`);
             gptService = new EnhancedGptService();
-            applyTelephonyTools(gptService, callSid);
           }
           
           gptService.setCallSid(callSid);
@@ -1109,6 +1254,7 @@ app.ws('/connection', (ws, req) => {
           if (callConfig) {
             await applyInitialDigitIntent(callSid, callConfig, gptService, interactionCount);
           }
+          configureCallTools(gptService, callSid, callConfig, functionSystem);
 
           let gptErrorCount = 0;
 
@@ -1323,7 +1469,7 @@ app.ws('/connection', (ws, req) => {
             }
             const activeExpectation = digitService.getExpectation(callSid);
             const display = activeExpectation?.profile === 'verification'
-              ? digitService.formatOtpForDisplay(digits, 'progress')
+              ? digitService.formatOtpForDisplay(digits, 'progress', activeExpectation?.max_digits)
               : `Keypad: ${digits}`;
             webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
             const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
@@ -1407,7 +1553,12 @@ app.ws('/connection', (ws, req) => {
       
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
       if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
-        const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+        const activeExpectation = digitService.getExpectation(callSid);
+        const progress = digitService.formatOtpForDisplay(
+          otpContext.codes[otpContext.codes.length - 1],
+          'progress',
+          activeExpectation?.max_digits
+        );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
@@ -1435,22 +1586,34 @@ app.ws('/connection', (ws, req) => {
         return;
       }
       
-      // Process with adaptive personality and functions
-      await enqueueGptTask(callSid, async () => {
-        const currentCount = interactionCount;
-        try {
-          await gptService.completion(otpContext.maskedForGpt, currentCount);
-        } catch (gptError) {
-          console.error('GPT completion error:', gptError);
-          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-        }
-        const nextCount = currentCount + 1;
+      const getInteractionCount = () => interactionCount;
+      const setInteractionCount = (nextCount) => {
         interactionCount = nextCount;
         const session = activeCalls.get(callSid);
         if (session) {
           session.interactionCount = nextCount;
         }
-      });
+      };
+      if (isDigitIntent) {
+        await enqueueGptTask(callSid, async () => {
+          const currentCount = interactionCount;
+          try {
+            await gptService.completion(otpContext.maskedForGpt, currentCount);
+          } catch (gptError) {
+            console.error('GPT completion error:', gptError);
+            webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+          }
+          setInteractionCount(currentCount + 1);
+        });
+        return;
+      }
+      await processNormalFlowTranscript(
+        callSid,
+        otpContext.maskedForGpt,
+        gptService,
+        getInteractionCount,
+        setInteractionCount
+      );
 
     });
     
@@ -1476,6 +1639,7 @@ app.ws('/connection', (ws, req) => {
         digitService.clearCallState(callSid);
       }
       clearGptQueue(callSid);
+      clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1512,10 +1676,8 @@ app.ws('/vonage/stream', async (ws, req) => {
     let gptService;
     if (functionSystem) {
       gptService = new EnhancedGptService(callConfig?.prompt, callConfig?.first_message);
-      applyTelephonyTools(gptService, callSid, functionSystem.functions, functionSystem.implementations);
     } else {
       gptService = new EnhancedGptService(callConfig?.prompt, callConfig?.first_message);
-      applyTelephonyTools(gptService, callSid);
     }
 
     gptService.setCallSid(callSid);
@@ -1524,6 +1686,7 @@ app.ws('/vonage/stream', async (ws, req) => {
     const intentLine = `Call intent: ${callConfig?.template || 'general'} | purpose: ${callConfig?.purpose || 'general'} | business: ${callConfig?.business_context?.business_id || callConfig?.business_id || 'unspecified'}. Keep replies concise and on-task.`;
     gptService.setCallIntent(intentLine);
     await applyInitialDigitIntent(callSid, callConfig, gptService, 0);
+    configureCallTools(gptService, callSid, callConfig, functionSystem);
 
     activeCalls.set(callSid, {
       startTime: new Date(),
@@ -1634,7 +1797,12 @@ app.ws('/vonage/stream', async (ws, req) => {
       }
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
       if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
-        const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+        const activeExpectation = digitService.getExpectation(callSid);
+        const progress = digitService.formatOtpForDisplay(
+          otpContext.codes[otpContext.codes.length - 1],
+          'progress',
+          activeExpectation?.max_digits
+        );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
@@ -1659,21 +1827,34 @@ app.ws('/vonage/stream', async (ws, req) => {
         }
         return;
       }
-      await enqueueGptTask(callSid, async () => {
-        const currentCount = interactionCount;
-        try {
-          await gptService.completion(otpContext.maskedForGpt, currentCount);
-        } catch (gptError) {
-          console.error('GPT completion error:', gptError);
-          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-        }
-        const nextCount = currentCount + 1;
+      const getInteractionCount = () => interactionCount;
+      const setInteractionCount = (nextCount) => {
         interactionCount = nextCount;
         const session = activeCalls.get(callSid);
         if (session) {
           session.interactionCount = nextCount;
         }
-      });
+      };
+      if (isDigitIntent) {
+        await enqueueGptTask(callSid, async () => {
+          const currentCount = interactionCount;
+          try {
+            await gptService.completion(otpContext.maskedForGpt, currentCount);
+          } catch (gptError) {
+            console.error('GPT completion error:', gptError);
+            webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+          }
+          setInteractionCount(currentCount + 1);
+        });
+        return;
+      }
+      await processNormalFlowTranscript(
+        callSid,
+        otpContext.maskedForGpt,
+        gptService,
+        getInteractionCount,
+        setInteractionCount
+      );
 
     });
 
@@ -1704,6 +1885,7 @@ app.ws('/vonage/stream', async (ws, req) => {
         digitService.clearCallState(callSid);
       }
       clearGptQueue(callSid);
+      clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1792,7 +1974,12 @@ app.ws('/aws/stream', (ws, req) => {
 
       webhookService.recordTranscriptTurn(callSid, 'user', otpContext.raw);
       if (isDigitIntent && otpContext.codes && otpContext.codes.length && digitService?.hasExpectation(callSid)) {
-        const progress = digitService.formatOtpForDisplay(otpContext.codes[otpContext.codes.length - 1], 'progress');
+        const activeExpectation = digitService.getExpectation(callSid);
+        const progress = digitService.formatOtpForDisplay(
+          otpContext.codes[otpContext.codes.length - 1],
+          'progress',
+          activeExpectation?.max_digits
+        );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
         const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
         if (collection.accepted && collection.route && !callEndLocks.has(callSid)) {
@@ -1814,20 +2001,33 @@ app.ws('/aws/stream', (ws, req) => {
         return;
       }
 
-      await enqueueGptTask(callSid, async () => {
-        const currentCount = interactionCount;
-        try {
-          await session.gptService.completion(otpContext.maskedForGpt, currentCount);
-        } catch (gptError) {
-          console.error('GPT completion error:', gptError);
-          webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
-        }
-        const nextCount = currentCount + 1;
+      const getInteractionCount = () => interactionCount;
+      const setInteractionCount = (nextCount) => {
         interactionCount = nextCount;
         if (session) {
           session.interactionCount = nextCount;
         }
-      });
+      };
+      if (isDigitIntent) {
+        await enqueueGptTask(callSid, async () => {
+          const currentCount = interactionCount;
+          try {
+            await session.gptService.completion(otpContext.maskedForGpt, currentCount);
+          } catch (gptError) {
+            console.error('GPT completion error:', gptError);
+            webhookService.addLiveEvent(callSid, '⚠️ GPT error, retrying', { force: true });
+          }
+          setInteractionCount(currentCount + 1);
+        });
+        return;
+      }
+      await processNormalFlowTranscript(
+        callSid,
+        otpContext.maskedForGpt,
+        session.gptService,
+        getInteractionCount,
+        setInteractionCount
+      );
     });
 
     ws.on('message', (data) => {
@@ -1857,6 +2057,7 @@ app.ws('/aws/stream', (ws, req) => {
         digitService.clearCallState(callSid);
       }
       clearGptQueue(callSid);
+      clearNormalFlowState(callSid);
       clearCallEndLock(callSid);
       clearSilenceTimer(callSid);
     });
@@ -1874,6 +2075,7 @@ async function handleCallEnd(callSid, callStartTime) {
     const callEndTime = new Date();
     const duration = Math.round((callEndTime - callStartTime) / 1000);
     clearGptQueue(callSid);
+    clearNormalFlowState(callSid);
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);
@@ -2433,6 +2635,26 @@ app.post('/admin/provider', requireAdminToken, async (req, res) => {
   return res.json({ success: true, provider: currentProvider, changed });
 });
 
+app.post('/admin/replay/call-status', requireAdminToken, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const sample = payload.sample;
+    const callSid = payload.call_sid || payload.CallSid;
+    if (sample && !callSid) {
+      return res.status(400).json({ success: false, error: 'call_sid is required when using sample' });
+    }
+    const resolvedPayload = sample ? (buildSampleCallStatusPayload(sample, callSid) || payload) : payload;
+    const result = await processCallStatusWebhookPayload(resolvedPayload, { source: 'replay' });
+    if (!result?.ok) {
+      return res.status(404).json({ success: false, error: result?.error || 'call_not_found' });
+    }
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Replay call-status error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Personas list for bot selection
 app.get('/api/personas', async (req, res) => {
   res.json({
@@ -2615,6 +2837,7 @@ async function placeOutboundCall(payload, hostOverride = null) {
   let providerMetadata = {};
 
   if (currentProvider === 'twilio') {
+    warnIfMachineDetectionDisabled('outbound-call');
     const accountSid = config.twilio.accountSid;
     const authToken = config.twilio.authToken;
     const fromNumber = config.twilio.fromNumber;
@@ -2627,14 +2850,21 @@ async function placeOutboundCall(payload, hostOverride = null) {
     const twimlUrl = `https://${host}/incoming`;
     const statusUrl = `https://${host}/webhook/call-status`;
     console.log(`Twilio call URLs: twiml=${twimlUrl} statusCallback=${statusUrl}`);
-    const call = await client.calls.create({
+    const callPayload = {
       url: twimlUrl,
       to: number,
       from: fromNumber,
       statusCallback: statusUrl,
       statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
       statusCallbackMethod: 'POST'
-    });
+    };
+    if (config.twilio?.machineDetection) {
+      callPayload.machineDetection = config.twilio.machineDetection;
+    }
+    if (Number.isFinite(config.twilio?.machineDetectionTimeout)) {
+      callPayload.machineDetectionTimeout = config.twilio.machineDetectionTimeout;
+    }
+    const call = await client.calls.create(callPayload);
     callId = call.sid;
     callStatus = call.status || 'queued';
   } else if (currentProvider === 'aws') {
@@ -2818,209 +3048,268 @@ app.post('/outbound-call', async (req, res) => {
   }
 });
 
+function buildSampleCallStatusPayload(sample, callSid) {
+  if (!callSid) {
+    return null;
+  }
+  const normalized = String(sample || '').toLowerCase();
+  const base = {
+    CallSid: callSid,
+    From: '+15551230000',
+    To: '+15551239999'
+  };
+  if (normalized === 'voicemail') {
+    return {
+      ...base,
+      CallStatus: 'completed',
+      AnsweredBy: 'machine_start',
+      CallDuration: '0',
+      DialCallDuration: '0'
+    };
+  }
+  if (normalized === 'human') {
+    return {
+      ...base,
+      CallStatus: 'completed',
+      AnsweredBy: 'human',
+      CallDuration: '42',
+      DialCallDuration: '42'
+    };
+  }
+  if (normalized === 'no-answer') {
+    return {
+      ...base,
+      CallStatus: 'no-answer'
+    };
+  }
+  return null;
+}
+
+async function processCallStatusWebhookPayload(payload = {}, options = {}) {
+  const {
+    CallSid,
+    CallStatus,
+    Duration,
+    From,
+    To,
+    CallDuration,
+    AnsweredBy,
+    ErrorCode,
+    ErrorMessage,
+    DialCallDuration
+  } = payload || {};
+
+  if (!CallSid) {
+    const err = new Error('Missing CallSid');
+    err.code = 'missing_call_sid';
+    throw err;
+  }
+
+  const source = options.source || 'provider';
+
+  console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
+  console.log(`Debug Info:`);
+  console.log(`Duration: ${Duration || 'N/A'}`);
+  console.log(`CallDuration: ${CallDuration || 'N/A'}`);
+  console.log(`DialCallDuration: ${DialCallDuration || 'N/A'}`);
+  console.log(`AnsweredBy: ${AnsweredBy || 'N/A'}`);
+
+  const durationCandidates = [Duration, CallDuration, DialCallDuration]
+    .map((value) => parseInt(value, 10))
+    .filter((value) => Number.isFinite(value));
+  const durationValue = durationCandidates.length ? Math.max(...durationCandidates) : 0;
+
+  const call = await db.getCall(CallSid);
+  if (!call) {
+    console.warn(`Webhook received for unknown call: ${CallSid}`);
+    return { ok: false, error: 'call_not_found', callSid: CallSid };
+  }
+
+  let notificationType = null;
+  const rawStatus = String(CallStatus || '').toLowerCase();
+  const answeredByValue = String(AnsweredBy || '').toLowerCase();
+  const isMachineAnswered = ['machine_start', 'machine_end', 'machine', 'fax'].includes(answeredByValue);
+  const voicemailDetected = isMachineAnswered;
+  let actualStatus = rawStatus || 'unknown';
+
+  if (voicemailDetected) {
+    console.log(`AMD detected voicemail (${answeredByValue}) - classifying as no-answer`.yellow);
+    actualStatus = 'no-answer';
+    notificationType = 'call_no_answer';
+  } else if (actualStatus === 'completed') {
+    const priorStatus = String(call.status || '').toLowerCase();
+    const hasAnswerEvidence =
+      !!call.started_at ||
+      ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
+      durationValue > 0;
+
+    console.log(`Analyzing completed call: Duration = ${durationValue}s`);
+
+    if ((durationValue === 0 || durationValue < 3) && !hasAnswerEvidence) {
+      console.log(`Short duration detected (${durationValue}s) - treating as no-answer`.red);
+      actualStatus = 'no-answer';
+      notificationType = 'call_no_answer';
+    } else if (voicemailDetected && durationValue < 10 && !hasAnswerEvidence) {
+      console.log(`Voicemail detected with short duration - classifying as no-answer`.red);
+      actualStatus = 'no-answer';
+      notificationType = 'call_no_answer';
+    } else {
+      console.log(`Valid call duration (${durationValue}s) - confirmed answered`);
+      actualStatus = 'completed';
+      notificationType = 'call_completed';
+    }
+  } else {
+    switch (actualStatus) {
+      case 'queued':
+      case 'initiated':
+        notificationType = 'call_initiated';
+        break;
+      case 'ringing':
+        notificationType = 'call_ringing';
+        break;
+      case 'in-progress':
+        notificationType = 'call_in_progress';
+        break;
+      case 'answered':
+        notificationType = 'call_answered';
+        break;
+      case 'busy':
+        notificationType = 'call_busy';
+        break;
+      case 'no-answer':
+        notificationType = 'call_no_answer';
+        break;
+      case 'voicemail':
+        actualStatus = 'no-answer';
+        notificationType = 'call_no_answer';
+        break;
+      case 'failed':
+        notificationType = 'call_failed';
+        break;
+      case 'canceled':
+        notificationType = 'call_canceled';
+        break;
+      default:
+        console.warn(`Unknown call status: ${CallStatus}`);
+        notificationType = `call_${actualStatus}`;
+    }
+  }
+
+  const priorStatus = String(call.status || '').toLowerCase();
+  const hasAnswerEvidence = !!call.started_at ||
+    ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
+    durationValue > 0 ||
+    !!AnsweredBy;
+
+  if (actualStatus === 'no-answer' && hasAnswerEvidence && !voicemailDetected) {
+    actualStatus = 'completed';
+    notificationType = 'call_completed';
+  }
+
+  console.log(`Final determination: ${CallStatus} → ${actualStatus} → ${notificationType}`);
+
+  const updateData = {
+    duration: durationValue,
+    twilio_status: CallStatus,
+    answered_by: AnsweredBy,
+    error_code: ErrorCode,
+    error_message: ErrorMessage
+  };
+
+  if (actualStatus === 'ringing') {
+    try {
+      await db.updateCallState(CallSid, 'ringing', { at: new Date().toISOString() });
+    } catch (stateError) {
+      console.error('Failed to record ringing state:', stateError);
+    }
+  }
+
+  if (actualStatus === 'no-answer' && call.created_at) {
+    let ringStart = null;
+    try {
+      const ringState = await db.getLatestCallState(CallSid, 'ringing');
+      ringStart = ringState?.at || ringState?.timestamp || null;
+    } catch (stateError) {
+      console.error('Failed to load ringing state:', stateError);
+    }
+
+    const now = new Date();
+    const callStart = new Date(call.created_at);
+    const ringStartTime = ringStart ? new Date(ringStart) : callStart;
+    const ringDuration = Math.round((now - ringStartTime) / 1000);
+    updateData.ring_duration = ringDuration;
+    if (!updateData.duration || updateData.duration < ringDuration) {
+      updateData.duration = ringDuration;
+    }
+    console.log(`Calculated ring duration: ${ringDuration}s`);
+  }
+
+  if (['in-progress', 'answered'].includes(actualStatus) && !call.started_at) {
+    updateData.started_at = new Date().toISOString();
+  } else if (!call.ended_at) {
+    const isTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus);
+    const rawTerminal = ['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(rawStatus);
+    if (isTerminal && rawTerminal) {
+      updateData.ended_at = new Date().toISOString();
+    }
+  }
+
+  await db.updateCallStatus(CallSid, actualStatus, updateData);
+
+  if (call.user_chat_id && notificationType && !options.skipNotifications) {
+    try {
+      await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
+      console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`);
+
+      if (actualStatus !== CallStatus.toLowerCase()) {
+        await db.logServiceHealth('webhook_system', 'status_corrected', {
+          call_sid: CallSid,
+          original_status: CallStatus,
+          corrected_status: actualStatus,
+          duration: updateData.duration,
+          reason: 'Short duration analysis',
+          source
+        });
+      }
+    } catch (notificationError) {
+      console.error('Error creating enhanced webhook notification:', notificationError);
+    }
+  }
+
+  console.log(`Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`);
+  if (updateData.duration) {
+    const minutes = Math.floor(updateData.duration / 60);
+    const seconds = updateData.duration % 60;
+    console.log(`Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`);
+  }
+
+  await db.logServiceHealth('webhook_system', 'status_received', {
+    call_sid: CallSid,
+    original_status: CallStatus,
+    final_status: actualStatus,
+    duration: updateData.duration,
+    answered_by: AnsweredBy,
+    correction_applied: actualStatus !== CallStatus.toLowerCase(),
+    source
+  });
+
+  return {
+    ok: true,
+    callSid: CallSid,
+    rawStatus,
+    actualStatus,
+    notificationType,
+    duration: updateData.duration,
+    voicemailDetected
+  };
+}
+
 // Enhanced webhook endpoint for call status updates
 
 app.post('/webhook/call-status', async (req, res) => {
   try {
-    const { 
-      CallSid, 
-      CallStatus, 
-      Duration, 
-      From, 
-      To, 
-      CallDuration,
-      AnsweredBy,
-      ErrorCode,
-      ErrorMessage,
-      DialCallDuration // This is key for detecting actual answer vs no-answer
-    } = req.body;
     warnOnInvalidTwilioSignature(req, '/webhook/call-status');
-
-    console.log(`Fixed Webhook: Call ${CallSid} status: ${CallStatus}`.blue);
-    console.log(`Debug Info:`);
-    console.log(`Duration: ${Duration || 'N/A'}`);
-    console.log(`CallDuration: ${CallDuration || 'N/A'}`);
-    console.log(`DialCallDuration: ${DialCallDuration || 'N/A'}`);
-    console.log(`AnsweredBy: ${AnsweredBy || 'N/A'}`);
-
-    const durationCandidates = [Duration, CallDuration, DialCallDuration]
-      .map((value) => parseInt(value, 10))
-      .filter((value) => Number.isFinite(value));
-    const durationValue = durationCandidates.length ? Math.max(...durationCandidates) : 0;
-    
-    // Get call details from database
-    const call = await db.getCall(CallSid);
-    if (!call) {
-      console.warn(`Webhook received for unknown call: ${CallSid}`);
-      res.status(200).send('OK');
-      return;
-    }
-
-    // Enhanced logic for determining actual call outcome
-    let notificationType = null;
-    const rawStatus = String(CallStatus || '').toLowerCase();
-    let actualStatus = rawStatus || 'unknown';
-    
-    // Special handling for "completed" status - check if it was actually answered
-    if (actualStatus === 'completed') {
-      const priorStatus = String(call.status || '').toLowerCase();
-      const hasAnswerEvidence =
-        !!call.started_at ||
-        ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
-        durationValue > 0;
-      
-      console.log(`Analyzing completed call: Duration = ${durationValue}s`);
-      
-      // If call completed but duration is very short (< 3 seconds), it's likely no-answer
-      // unless we already recorded an answer signal
-      if ((durationValue === 0 || durationValue < 3) && !hasAnswerEvidence) {
-        console.log(`Short duration detected (${durationValue}s) - treating as no-answer`.red);
-        actualStatus = 'no-answer';
-        notificationType = 'call_no_answer';
-      } else if (AnsweredBy === 'machine_start' && durationValue < 10 && !hasAnswerEvidence) {
-        console.log(`Voicemail detected with short duration - treating as no-answer`.red);
-        actualStatus = 'no-answer';
-        notificationType = 'call_no_answer';
-      } else {
-        console.log(`Valid call duration (${durationValue}s) - confirmed answered`);
-        actualStatus = 'completed';
-        notificationType = 'call_completed';
-      }
-    } else {
-      // Handle other statuses normally
-      switch (actualStatus) {
-        case 'queued':
-        case 'initiated':
-          notificationType = 'call_initiated';
-          break;
-        case 'ringing':
-          notificationType = 'call_ringing';
-          break;
-        case 'in-progress':
-          notificationType = 'call_in_progress';
-          break;
-        case 'answered':
-          notificationType = 'call_answered';
-          break;
-        case 'busy':
-          notificationType = 'call_busy';
-          break;
-        case 'no-answer':
-          notificationType = 'call_no_answer';
-          break;
-        case 'failed':
-          notificationType = 'call_failed';
-          break;
-        case 'canceled':
-          notificationType = 'call_canceled';
-          break;
-        default:
-          console.warn(`Unknown call status: ${CallStatus}`);
-          notificationType = `call_${actualStatus}`;
-      }
-    }
-
-    const priorStatus = String(call.status || '').toLowerCase();
-    const hasAnswerEvidence = !!call.started_at ||
-      ['answered', 'in-progress', 'completed'].includes(priorStatus) ||
-      durationValue > 0 ||
-      !!AnsweredBy;
-
-    if (actualStatus === 'no-answer' && hasAnswerEvidence) {
-      actualStatus = 'completed';
-      notificationType = 'call_completed';
-    }
-
-    console.log(`Final determination: ${CallStatus} → ${actualStatus} → ${notificationType}`);
-
-    // Update call status in database with enhanced data
-    const updateData = {
-      duration: durationValue,
-      twilio_status: CallStatus,
-      answered_by: AnsweredBy,
-      error_code: ErrorCode,
-      error_message: ErrorMessage
-    };
-
-    if (actualStatus === 'ringing') {
-      try {
-        await db.updateCallState(CallSid, 'ringing', { at: new Date().toISOString() });
-      } catch (stateError) {
-        console.error('Failed to record ringing state:', stateError);
-      }
-    }
-
-    // Calculate ring duration for no-answer cases
-    if (actualStatus === 'no-answer' && call.created_at) {
-      let ringStart = null;
-      try {
-        const ringState = await db.getLatestCallState(CallSid, 'ringing');
-        ringStart = ringState?.at || ringState?.timestamp || null;
-      } catch (stateError) {
-        console.error('Failed to load ringing state:', stateError);
-      }
-
-      const now = new Date();
-      const callStart = new Date(call.created_at);
-      const ringStartTime = ringStart ? new Date(ringStart) : callStart;
-      const ringDuration = Math.round((now - ringStartTime) / 1000);
-      updateData.ring_duration = ringDuration;
-      if (!updateData.duration || updateData.duration < ringDuration) {
-        updateData.duration = ringDuration;
-      }
-      console.log(`Calculated ring duration: ${ringDuration}s`);
-    }
-
-    // Set timestamps based on actual status (not original CallStatus)
-    if (['in-progress', 'answered'].includes(actualStatus) && !call.started_at) {
-      updateData.started_at = new Date().toISOString();
-    } else if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus) && !call.ended_at) {
-      updateData.ended_at = new Date().toISOString();
-    }
-
-    await db.updateCallStatus(CallSid, actualStatus, updateData);
-
-    // Create enhanced webhook notification with corrected status
-    if (call.user_chat_id && notificationType) {
-      try {
-        await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
-        console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`);
-
-        // Log the correction if we changed the status
-        if (actualStatus !== CallStatus.toLowerCase()) {
-          await db.logServiceHealth('webhook_system', 'status_corrected', {
-            call_sid: CallSid,
-            original_status: CallStatus,
-            corrected_status: actualStatus,
-            duration: updateData.duration,
-            reason: 'Short duration analysis'
-          });
-        }
-      } catch (notificationError) {
-        console.error('Error creating enhanced webhook notification:', notificationError);
-      }
-    }
-    
-    // Log comprehensive status update
-    console.log(`Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`);
-    if (updateData.duration) {
-      const minutes = Math.floor(updateData.duration / 60);
-      const seconds = updateData.duration % 60;
-      console.log(`Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`);
-    }
-
-    // Log to service health with correction info
-    await db.logServiceHealth('webhook_system', 'status_received', {
-      call_sid: CallSid,
-      original_status: CallStatus,
-      final_status: actualStatus,
-      duration: updateData.duration,
-      answered_by: AnsweredBy,
-      correction_applied: actualStatus !== CallStatus.toLowerCase()
-    });
-    
-    res.status(200).send('OK');
-    
+    await processCallStatusWebhookPayload(req.body, { source: 'provider' });
   } catch (error) {
     console.error('Error processing fixed call status webhook:', error);
     
@@ -3029,14 +3318,13 @@ app.post('/webhook/call-status', async (req, res) => {
       await db.logServiceHealth('webhook_system', 'error', {
         operation: 'process_webhook',
         error: error.message,
-        call_sid: req.body.CallSid
+        call_sid: req.body?.CallSid
       });
     } catch (logError) {
       console.error('Failed to log webhook error:', logError);
     }
-    
-    res.status(200).send('OK');
   }
+  res.status(200).send('OK');
 });
 
 // Twilio Media Stream status callback
@@ -4058,7 +4346,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     if (digits) {
       const expectation = digitService.getExpectation(callSid);
       const display = expectation?.profile === 'verification'
-        ? digitService.formatOtpForDisplay(digits, 'progress')
+        ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
         : `Keypad (Gather): ${digits}`;
       webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
       const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });

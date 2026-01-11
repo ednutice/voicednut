@@ -60,6 +60,22 @@ function createDigitCollectionService(options = {}) {
     const map = {
       verification: 'OTP',
       otp: 'OTP',
+      ssn: 'SSN',
+      dob: 'DOB',
+      routing_number: 'Routing',
+      bank_account: 'Bank Acct',
+      phone: 'Phone',
+      member_id: 'Member ID',
+      policy_number: 'Policy',
+      invoice_number: 'Invoice',
+      confirmation_code: 'Confirm',
+      tax_id: 'Tax ID',
+      ein: 'EIN',
+      claim_number: 'Claim',
+      order_number: 'Order',
+      reservation_number: 'Reservation',
+      ticket_number: 'Ticket',
+      case_number: 'Case',
       account: 'Account',
       zip: 'ZIP',
       extension: 'Ext',
@@ -111,6 +127,38 @@ function createDigitCollectionService(options = {}) {
         return 'rating';
       case 'callback_confirm':
         return 'phone number';
+      case 'ssn':
+        return 'social security number';
+      case 'dob':
+        return 'date of birth';
+      case 'routing_number':
+        return 'routing number';
+      case 'bank_account':
+        return 'bank account number';
+      case 'phone':
+        return 'phone number';
+      case 'member_id':
+        return 'member ID';
+      case 'policy_number':
+        return 'policy number';
+      case 'invoice_number':
+        return 'invoice number';
+      case 'confirmation_code':
+        return 'confirmation code';
+      case 'tax_id':
+        return 'tax ID';
+      case 'ein':
+        return 'employer ID';
+      case 'claim_number':
+        return 'claim number';
+      case 'order_number':
+        return 'order number';
+      case 'reservation_number':
+        return 'reservation number';
+      case 'ticket_number':
+        return 'ticket number';
+      case 'case_number':
+        return 'case number';
       case 'verification':
       case 'otp':
         return `${digitLabel} code`;
@@ -189,8 +237,24 @@ function createDigitCollectionService(options = {}) {
   const pendingDigits = new Map();
 
   const DIGIT_PROFILE_DEFAULTS = {
-    verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false },
-    otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: false },
+    verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
+    otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
+    ssn: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    dob: { min_digits: 6, max_digits: 8, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    routing_number: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    bank_account: { min_digits: 6, max_digits: 17, timeout_s: 18, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    phone: { min_digits: 10, max_digits: 10, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    member_id: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    policy_number: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    invoice_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    confirmation_code: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    tax_id: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    ein: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    claim_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    order_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    reservation_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    ticket_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    case_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: false },
     card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
@@ -323,10 +387,49 @@ function createDigitCollectionService(options = {}) {
   }
 
   function buildDigitPrompt(expectation) {
-    const min = expectation?.min_digits || 1;
-    const max = expectation?.max_digits || min;
-    const label = min === max ? `${min}-digit` : `${min}-${max} digit`;
-    return `Please enter the ${label} code using your keypad.`;
+    const label = buildExpectedLabel(expectation);
+    const terminatorSuffix = expectation?.allow_terminator
+      ? ` You can end with ${expectation?.terminator_char || '#'} when finished.`
+      : '';
+    return `Please enter the ${label} using your keypad.${terminatorSuffix}`;
+  }
+
+  function buildConfirmationMessage(expectation = {}, collection = {}) {
+    const profile = String(expectation.profile || collection.profile || 'generic').toLowerCase();
+    const style = expectation.confirmation_style || 'none';
+    const speak = expectation.speak_confirmation === true || style !== 'none';
+    if (!speak) return '';
+
+    if (style === 'spoken_amount' && collection.digits) {
+      const amountCents = Number(collection.digits);
+      if (!Number.isNaN(amountCents)) {
+        const dollars = (amountCents / 100).toFixed(2);
+        return `Thanks, I noted ${dollars} dollars.`;
+      }
+    }
+
+    if (style === 'last4' && collection.digits) {
+      const last4 = collection.digits.slice(-4);
+      if (last4) {
+        return `Thanks, I have the number ending in ${last4}.`;
+      }
+    }
+
+    switch (profile) {
+      case 'menu':
+        return 'Thanks, I have your selection.';
+      case 'verification':
+      case 'otp':
+        return 'Thanks, your code is received.';
+      case 'extension':
+        return 'Thanks, I have the extension.';
+      case 'zip':
+        return 'Thanks, I have the ZIP code.';
+      case 'account':
+        return 'Thanks, I have the account number.';
+      default:
+        return 'Thanks, I have that.';
+    }
   }
 
   function clearDigitTimeout(callSid) {
@@ -409,6 +512,19 @@ function createDigitCollectionService(options = {}) {
     return sum % 10 === 0;
   }
 
+  function isValidRoutingNumber(value = '') {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (digits.length !== 9) return false;
+    const weights = [3, 7, 1, 3, 7, 1, 3, 7, 1];
+    let sum = 0;
+    for (let i = 0; i < 9; i += 1) {
+      const n = Number(digits[i]);
+      if (Number.isNaN(n)) return false;
+      sum += n * weights[i];
+    }
+    return sum % 10 === 0;
+  }
+
   function validateProfileDigits(profile = 'generic', digits = '') {
     const value = String(digits || '');
     if (!value) {
@@ -417,10 +533,37 @@ function createDigitCollectionService(options = {}) {
 
     switch (String(profile || '').toLowerCase()) {
       case 'verification':
-        if (value.length === otpLength) {
-          return { valid: true };
+      case 'otp':
+        return { valid: true };
+      case 'ssn':
+        return value.length === 9 ? { valid: true } : { valid: false, reason: 'invalid_length' };
+      case 'dob': {
+        if (value.length !== 6 && value.length !== 8) {
+          return { valid: false, reason: 'invalid_length' };
         }
-        return { valid: false, reason: 'invalid_length' };
+        const month = Number(value.slice(0, 2));
+        const day = Number(value.slice(2, 4));
+        if (!month || month < 1 || month > 12) {
+          return { valid: false, reason: 'invalid_month' };
+        }
+        if (!day || day < 1 || day > 31) {
+          return { valid: false, reason: 'invalid_day' };
+        }
+        return { valid: true };
+      }
+      case 'routing_number':
+        return isValidRoutingNumber(value)
+          ? { valid: true }
+          : { valid: false, reason: 'invalid_routing' };
+      case 'bank_account':
+        return value.length >= 6 && value.length <= 17
+          ? { valid: true }
+          : { valid: false, reason: 'invalid_length' };
+      case 'phone':
+        return value.length === 10 ? { valid: true } : { valid: false, reason: 'invalid_phone' };
+      case 'tax_id':
+      case 'ein':
+        return value.length === 9 ? { valid: true } : { valid: false, reason: 'invalid_length' };
       case 'cvv':
         if (value.length === 3 || value.length === 4) {
           return { valid: true };
@@ -722,13 +865,14 @@ function createDigitCollectionService(options = {}) {
     return true;
   }
 
-  function formatOtpForDisplay(digits, mode = otpDisplayMode) {
+  function formatOtpForDisplay(digits, mode = otpDisplayMode, expectedLength = null) {
     const safeDigits = String(digits || '').replace(/\D/g, '');
+    const targetLen = Number.isFinite(expectedLength) && expectedLength > 0 ? expectedLength : otpLength;
     if (mode === 'length') {
       return `OTP received (${safeDigits.length} digits)`;
     }
     if (mode === 'progress') {
-      return `OTP entry: ${safeDigits.length}/${otpLength} digits received`;
+      return `OTP entry: ${safeDigits.length}/${targetLen} digits received`;
     }
     if (!safeDigits) return 'OTP received';
     const maskLen = Math.max(0, safeDigits.length - 2);
@@ -928,6 +1072,176 @@ function createDigitCollectionService(options = {}) {
       return null;
     }
 
+    if (/\b(ssn|social security)\b/.test(lower)) {
+      return {
+        profile: 'ssn',
+        min_digits: 9,
+        max_digits: 9,
+        force_exact_length: 9,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.8,
+        reason: 'ssn_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(date of birth|dob|birth date)\b/.test(lower)) {
+      return {
+        profile: 'dob',
+        min_digits: 6,
+        max_digits: 8,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.7,
+        reason: 'dob_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\brouting number\b/.test(lower)) {
+      return {
+        profile: 'routing_number',
+        min_digits: 9,
+        max_digits: 9,
+        force_exact_length: 9,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.7,
+        reason: 'routing_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(bank account|account number)\b/.test(lower)) {
+      return {
+        profile: 'bank_account',
+        min_digits: 6,
+        max_digits: 17,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'bank_account_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(phone number|callback number|call back number)\b/.test(lower)) {
+      return {
+        profile: 'phone',
+        min_digits: 10,
+        max_digits: 10,
+        force_exact_length: 10,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.65,
+        reason: 'phone_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(member id|member number)\b/.test(lower)) {
+      return {
+        profile: 'member_id',
+        min_digits: 6,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'member_id_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(tax id|tax identification|tin)\b/.test(lower)) {
+      return {
+        profile: 'tax_id',
+        min_digits: 9,
+        max_digits: 9,
+        force_exact_length: 9,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.65,
+        reason: 'tax_id_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(ein|employer identification)\b/.test(lower)) {
+      return {
+        profile: 'ein',
+        min_digits: 9,
+        max_digits: 9,
+        force_exact_length: 9,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.65,
+        reason: 'ein_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(policy number)\b/.test(lower)) {
+      return {
+        profile: 'policy_number',
+        min_digits: 6,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'policy_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(invoice number|invoice)\b/.test(lower)) {
+      return {
+        profile: 'invoice_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'invoice_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(confirmation code|confirmation number)\b/.test(lower)) {
+      return {
+        profile: 'confirmation_code',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'confirmation_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
     if (hasDigitWord || sixMention || pinMention) {
       return {
         profile: 'verification',
@@ -1031,7 +1345,7 @@ function createDigitCollectionService(options = {}) {
     const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
       .join(' ');
-    const payload = normalizeDigitExpectation({ ...step, prompt: '', prompt_hint: promptHint });
+    const payload = normalizeDigitExpectation({ ...step, prompt_hint: promptHint });
     payload.plan_id = plan.id;
     payload.plan_step_index = plan.index + 1;
     payload.plan_total_steps = plan.steps.length;
@@ -1065,10 +1379,10 @@ function createDigitCollectionService(options = {}) {
     scheduleDigitTimeout(callSid, gptService, interactionCount);
 
     if (gptService) {
-      const spokenPrompt = callConfig?.first_message || callConfig?.prompt || 'Please enter the digits now.';
+      const basePrompt = payload.prompt || buildDigitPrompt(payload);
       const instruction = payload.plan_total_steps
-        ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${spokenPrompt}`
-        : spokenPrompt;
+        ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${basePrompt}`
+        : basePrompt;
       gptService.emit('gptreply', {
         partialResponseIndex: null,
         partialResponse: instruction,
@@ -1091,7 +1405,7 @@ function createDigitCollectionService(options = {}) {
     const promptHint = [callConfig?.first_message, callConfig?.prompt]
       .filter(Boolean)
       .join(' ');
-    const payload = normalizeDigitExpectation({ ...args, prompt: '', prompt_hint: promptHint });
+    const payload = normalizeDigitExpectation({ ...args, prompt_hint: promptHint });
     try {
       await db.updateCallState(callSid, 'digit_collection_requested', payload);
       webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
@@ -1105,8 +1419,7 @@ function createDigitCollectionService(options = {}) {
       }
       scheduleDigitTimeout(callSid, gptService, 0);
       if (gptService) {
-        const spokenPrompt = callConfig?.first_message || callConfig?.prompt || `Please enter the ${payload.min_digits}-${payload.max_digits} digit code using your keypad now.`;
-        const instruction = spokenPrompt;
+        const instruction = payload.prompt || buildDigitPrompt(payload);
         const reply = {
           partialResponseIndex: null,
           partialResponse: instruction,
@@ -1137,11 +1450,17 @@ function createDigitCollectionService(options = {}) {
     clearDigitTimeout(callSid);
     clearDigitFallbackState(callSid);
 
+    const lastStep = steps[steps.length - 1] || {};
+    const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
+      ? args.end_call_on_success
+      : (typeof lastStep.end_call_on_success === 'boolean' ? lastStep.end_call_on_success : true);
     const plan = {
       id: `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
       steps,
       index: 0,
       active: true,
+      end_call_on_success: planEndOnSuccess,
+      completion_message: typeof args.completion_message === 'string' ? args.completion_message.trim() : '',
       created_at: new Date().toISOString()
     };
 
@@ -1159,6 +1478,7 @@ function createDigitCollectionService(options = {}) {
     if (!collection) return;
     const allowCallEnd = options.allowCallEnd === true;
     const expectation = digitCollectionManager.expectations.get(callSid);
+    const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
     const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
     const payload = {
       profile: collection.profile,
@@ -1210,8 +1530,8 @@ function createDigitCollectionService(options = {}) {
     }
 
     if (!collection.accepted && collection.reason === 'incomplete') {
-      if (collection.profile === 'verification') {
-        const progress = formatOtpForDisplay(collection.digits, 'progress');
+      if (collection.profile === 'verification' || collection.profile === 'otp') {
+        const progress = formatOtpForDisplay(collection.digits, 'progress', expectation?.max_digits);
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
       }
       scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
@@ -1237,7 +1557,8 @@ function createDigitCollectionService(options = {}) {
       clearDigitTimeout(callSid);
       clearDigitFallbackState(callSid);
       digitCollectionManager.expectations.delete(callSid);
-      switch (collection.profile) {
+      const profile = String(collection.profile || '').toLowerCase();
+      switch (profile) {
         case 'menu':
         case 'extension':
           if (collection.route) {
@@ -1245,9 +1566,8 @@ function createDigitCollectionService(options = {}) {
             await db.updateCallState(callSid, 'route_requested', { reason: collection.route, via: 'menu' }).catch(() => {});
           }
           break;
-        case 'account':
-        case 'zip':
         case 'verification':
+        case 'otp':
           webhookService.addLiveEvent(callSid, `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'length' : 'masked')}`, { force: true });
           await db.updateCallState(callSid, 'identity_confirmed', {
             method: 'digits',
@@ -1259,6 +1579,20 @@ function createDigitCollectionService(options = {}) {
             last_otp_masked: collection.masked
           }).catch(() => {});
           await db.updateCallState(callSid, 'otp_captured', {
+            masked: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'account':
+          webhookService.addLiveEvent(callSid, `🏷️ Account number captured (ending ${collection.masked.slice(-4)})`, { force: true });
+          await db.updateCallState(callSid, 'account_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'zip':
+          webhookService.addLiveEvent(callSid, `📮 ZIP captured`, { force: true });
+          await db.updateCallState(callSid, 'zip_captured', {
             masked: collection.masked,
             len: collection.len
           }).catch(() => {});
@@ -1303,6 +1637,118 @@ function createDigitCollectionService(options = {}) {
             expiry: collection.digits
           }).catch(() => {});
           break;
+        case 'ssn':
+          webhookService.addLiveEvent(callSid, '🪪 SSN captured', { force: true });
+          await db.updateCallState(callSid, 'ssn_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'dob':
+          webhookService.addLiveEvent(callSid, '🎂 DOB captured', { force: true });
+          await db.updateCallState(callSid, 'dob_captured', {
+            masked: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'routing_number':
+          webhookService.addLiveEvent(callSid, '🏦 Routing number captured', { force: true });
+          await db.updateCallState(callSid, 'routing_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'bank_account':
+          webhookService.addLiveEvent(callSid, '🏦 Bank account captured', { force: true });
+          await db.updateCallState(callSid, 'bank_account_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'phone':
+          webhookService.addLiveEvent(callSid, '📱 Phone number captured', { force: true });
+          await db.updateCallState(callSid, 'phone_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'member_id':
+          webhookService.addLiveEvent(callSid, '🧾 Member ID captured', { force: true });
+          await db.updateCallState(callSid, 'member_id_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'policy_number':
+          webhookService.addLiveEvent(callSid, '📄 Policy number captured', { force: true });
+          await db.updateCallState(callSid, 'policy_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'invoice_number':
+          webhookService.addLiveEvent(callSid, '🧾 Invoice number captured', { force: true });
+          await db.updateCallState(callSid, 'invoice_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'confirmation_code':
+          webhookService.addLiveEvent(callSid, '✅ Confirmation code captured', { force: true });
+          await db.updateCallState(callSid, 'confirmation_code_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'tax_id':
+          webhookService.addLiveEvent(callSid, '🧾 Tax ID captured', { force: true });
+          await db.updateCallState(callSid, 'tax_id_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'ein':
+          webhookService.addLiveEvent(callSid, '🏢 EIN captured', { force: true });
+          await db.updateCallState(callSid, 'ein_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'claim_number':
+          webhookService.addLiveEvent(callSid, '🧾 Claim number captured', { force: true });
+          await db.updateCallState(callSid, 'claim_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'order_number':
+          webhookService.addLiveEvent(callSid, '🧾 Order number captured', { force: true });
+          await db.updateCallState(callSid, 'order_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'reservation_number':
+          webhookService.addLiveEvent(callSid, '🧾 Reservation number captured', { force: true });
+          await db.updateCallState(callSid, 'reservation_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'ticket_number':
+          webhookService.addLiveEvent(callSid, '🧾 Ticket number captured', { force: true });
+          await db.updateCallState(callSid, 'ticket_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'case_number':
+          webhookService.addLiveEvent(callSid, '🧾 Case number captured', { force: true });
+          await db.updateCallState(callSid, 'case_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
         default:
           webhookService.addLiveEvent(callSid, `🔢 Digits captured (${collection.len})`, { force: true });
       }
@@ -1322,13 +1768,32 @@ function createDigitCollectionService(options = {}) {
             steps: plan.steps.length,
             completed_at: new Date().toISOString()
           }).catch(() => {});
-          await speakAndEndCall(callSid, closingMessage, 'digits_collected_plan');
+          const planShouldEnd = allowCallEnd && plan.end_call_on_success !== false;
+          if (planShouldEnd) {
+            const completionMessage = plan.completion_message || closingMessage;
+            await speakAndEndCall(callSid, completionMessage, 'digits_collected_plan');
+            return;
+          }
+          if (gptService) {
+            const completionMessage = plan.completion_message || 'Thanks, I have all the digits I need.';
+            emitReply(completionMessage);
+          }
           return;
         }
       }
 
-      // Single-step: always end the call after digits captured
-      await speakAndEndCall(callSid, closingMessage, collection.profile === 'verification' ? 'otp_verified' : 'digits_collected');
+      if (shouldEndCall) {
+        await speakAndEndCall(
+          callSid,
+          closingMessage,
+          (collection.profile === 'verification' || collection.profile === 'otp') ? 'otp_verified' : 'digits_collected'
+        );
+        return;
+      }
+      const confirmation = buildConfirmationMessage(expectation || {}, collection);
+      if (confirmation) {
+        emitReply(confirmation);
+      }
       return;
     } else {
       const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
@@ -1375,7 +1840,7 @@ function createDigitCollectionService(options = {}) {
     const summary = collection.accepted
       ? collection.route
         ? `✅ Digits accepted • routed: ${collection.route}`
-        : collection.profile === 'verification'
+        : (collection.profile === 'verification' || collection.profile === 'otp')
           ? `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'length' : 'masked')}`
           : `✅ Digits accepted (${collection.len})`
       : collection.fallback
@@ -1428,3 +1893,77 @@ function createDigitCollectionService(options = {}) {
 module.exports = {
   createDigitCollectionService
 };
+    if (/\b(claim number|claim)\b/.test(lower)) {
+      return {
+        profile: 'claim_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'claim_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(order number|order id|order)\b/.test(lower)) {
+      return {
+        profile: 'order_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'order_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(reservation number|reservation)\b/.test(lower)) {
+      return {
+        profile: 'reservation_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'reservation_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(ticket number|ticket id|ticket)\b/.test(lower)) {
+      return {
+        profile: 'ticket_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'ticket_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (/\b(case number|case id|case)\b/.test(lower)) {
+      return {
+        profile: 'case_number',
+        min_digits: 4,
+        max_digits: 12,
+        prompt: '',
+        end_call_on_success: false,
+        max_retries: 2,
+        confidence: 0.6,
+        reason: 'case_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }

@@ -21,13 +21,24 @@ class EnhancedWebhookService {
     this.callTimestamps = new Map(); // Track call timing for better status management
     this.noResponseTimers = new Map(); // Track fallback timers when no status arrives
     this.noResponseTimeoutMs = 30000;
-    this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'];
+    this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'voicemail', 'busy', 'no-answer', 'failed', 'canceled'];
     this.liveConsoleByCallSid = new Map();
     this.liveConsoleEditTimers = new Map();
     this.liveConsoleDebounceMs = 900;
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
-    this.waveformFrames = ['▁ ▂ ▃ ▄ ▅ ▆ ▇', '▂ ▃ ▄ ▅ ▆ ▇ ▁', '▃ ▄ ▅ ▆ ▇ ▁ ▂', '▄ ▅ ▆ ▇ ▁ ▂ ▃', '▅ ▆ ▇ ▁ ▂ ▃ ▄', '▆ ▇ ▁ ▂ ▃ ▄ ▅', '▇ ▁ ▂ ▃ ▄ ▅ ▆'];
+    this.waveformFrames = [
+      '▁ ▂ ▃ ▄ ▅ ▆ ▇ ▆ ▅',
+      '▂ ▃ ▄ ▅ ▆ ▇ ▆ ▅ ▄',
+      '▃ ▄ ▅ ▆ ▇ ▆ ▅ ▄ ▃',
+      '▄ ▅ ▆ ▇ ▆ ▅ ▄ ▃ ▂',
+      '▅ ▆ ▇ ▆ ▅ ▄ ▃ ▂ ▁',
+      '▆ ▇ ▆ ▅ ▄ ▃ ▂ ▁ ▂',
+      '▇ ▆ ▅ ▄ ▃ ▂ ▁ ▂ ▃',
+      '▆ ▅ ▄ ▃ ▂ ▁ ▂ ▃ ▄',
+      '▅ ▄ ▃ ▂ ▁ ▂ ▃ ▄ ▅',
+      '▄ ▃ ▂ ▁ ▂ ▃ ▄ ▅ ▆'
+    ];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -37,8 +48,13 @@ class EnhancedWebhookService {
     return String(value || '').toLowerCase().replace(/_/g, '-');
   }
 
+  isVoicemailAnswer(answeredBy) {
+    const value = String(answeredBy || '').toLowerCase();
+    return ['machine', 'machine_start', 'machine_end', 'fax'].includes(value);
+  }
+
   isTerminalStatus(status) {
-    return ['completed', 'no-answer', 'busy', 'failed', 'canceled'].includes(status);
+    return ['completed', 'no-answer', 'busy', 'failed', 'canceled', 'voicemail'].includes(status);
   }
 
   formatContactLabel(phoneNumber) {
@@ -71,6 +87,22 @@ class EnhancedWebhookService {
     const labels = {
       verification: 'OTP',
       otp: 'OTP',
+      ssn: 'SSN',
+      dob: 'DOB',
+      routing_number: 'Routing',
+      bank_account: 'Bank Acct',
+      phone: 'Phone',
+      member_id: 'Member ID',
+      policy_number: 'Policy',
+      invoice_number: 'Invoice',
+      confirmation_code: 'Confirm',
+      tax_id: 'Tax ID',
+      ein: 'EIN',
+      claim_number: 'Claim',
+      order_number: 'Order',
+      reservation_number: 'Reservation',
+      ticket_number: 'Ticket',
+      case_number: 'Case',
       account: 'Account',
       zip: 'ZIP',
       extension: 'Ext',
@@ -191,12 +223,17 @@ class EnhancedWebhookService {
       return false;
     }
 
-    if (lastStatus === 'completed') {
+    if (lastStatus === 'completed' && newStatus !== 'voicemail') {
       console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already completed`);
       return false;
     }
 
-    if (['busy', 'no-answer', 'failed', 'canceled'].includes(lastStatus) && newStatus === 'completed') {
+    if (lastStatus === 'voicemail') {
+      console.log(`⏭️ Skipping ${newStatus} because call ${call_sid} already ended as voicemail`);
+      return false;
+    }
+
+    if (['busy', 'no-answer', 'failed', 'canceled', 'voicemail'].includes(lastStatus) && newStatus === 'completed') {
       console.log(`⏭️ Skipping completed because call ${call_sid} already ended as ${lastStatus}`);
       return false;
     }
@@ -206,7 +243,7 @@ class EnhancedWebhookService {
     const newIndex = this.statusOrder.indexOf(newStatus);
 
     // Allow backwards progression for failure states
-    const failureStates = ['busy', 'no-answer', 'failed', 'canceled'];
+    const failureStates = ['busy', 'no-answer', 'failed', 'canceled', 'voicemail'];
     const isFailureTransition = failureStates.includes(newStatus);
     
     // Allow progression if moving forward or transitioning to failure state
@@ -327,6 +364,8 @@ class EnhancedWebhookService {
       const statusSource = correctedStatus !== effectiveStatus
         ? 'inferred'
         : (additionalData.status_source || 'provider');
+      const voicemailDetected = additionalData.voicemail_detected === true
+        || this.isVoicemailAnswer(additionalData.answered_by);
 
       const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
 
@@ -412,6 +451,14 @@ class EnhancedWebhookService {
             console.error('Failed to append digit summary:', error);
           }
           break;
+        case 'voicemail':
+          emoji = '📮';
+          this.clearNoResponseTimer(call_sid);
+          message = this.buildStatusBubble('voicemail', customerName, {
+            durationSeconds: additionalData.duration,
+            ringDuration: additionalData.ring_duration || additionalData.ringDuration
+          });
+          break;
 
         case 'busy':
           emoji = '📵';
@@ -430,7 +477,7 @@ class EnhancedWebhookService {
         case 'no-answer':
         case 'no_answer':
           emoji = '❌';
-          message = this.buildStatusBubble('no-answer', customerName);
+          message = this.buildStatusBubble('no-answer', customerName, { voicemailDetected });
           this.clearNoResponseTimer(call_sid);
 
           // Enhanced no-answer timing calculation
@@ -451,7 +498,14 @@ class EnhancedWebhookService {
           }
           
           if (ringTime > 0) {
-            message = this.buildStatusBubble('no-answer', customerName, { ringDuration: ringTime });
+            message = this.buildStatusBubble('no-answer', customerName, {
+              ringDuration: ringTime,
+              voicemailDetected
+            });
+          }
+
+          if (voicemailDetected) {
+            this.addLiveEvent(call_sid, '📮 Voicemail detected', { force: true });
           }
 
           console.log(`📞 No-answer notification: ${message}`);
@@ -474,9 +528,9 @@ class EnhancedWebhookService {
           message = this.buildStatusBubble(correctedStatus, customerName);
       }
 
-      const fullMessage = `${message}\nSource: ${statusSource}`;
-      const shouldSendBubble = ['completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled'];
-      const shouldOfferRetry = ['failed', 'busy', 'no-answer'].includes(correctedStatus);
+      const fullMessage = message;
+      const shouldSendBubble = ['completed', 'failed', 'busy', 'no-answer', 'no_answer', 'canceled', 'voicemail'];
+      const shouldOfferRetry = ['failed', 'busy', 'no-answer', 'voicemail'].includes(correctedStatus);
 
       if (shouldSendBubble.includes(correctedStatus)) {
         const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
@@ -494,7 +548,7 @@ class EnhancedWebhookService {
       }
 
       // Schedule cleanup for terminal states
-      if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(correctedStatus)) {
+      if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(correctedStatus)) {
         setTimeout(() => {
           this.cleanupCallData(call_sid);
         }, 5 * 60 * 1000); // Cleanup after 5 minutes
@@ -722,9 +776,21 @@ class EnhancedWebhookService {
           const noAnswerCall = await this.db.getCall(call_sid);
           success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
             ring_duration: noAnswerCall?.ring_duration,
+            answered_by: noAnswerCall?.answered_by,
+            voicemail_detected: this.isVoicemailAnswer(noAnswerCall?.answered_by),
             status_source: 'provider'
           });
           break;
+        case 'call_voicemail': {
+          const voicemailCall = await this.db.getCall(call_sid);
+          success = await this.sendCallStatusUpdate(call_sid, 'no-answer', telegram_chat_id, {
+            ring_duration: voicemailCall?.ring_duration,
+            answered_by: voicemailCall?.answered_by || 'machine',
+            voicemail_detected: true,
+            status_source: 'provider'
+          });
+          break;
+        }
         case 'call_canceled':
           success = await this.sendCallStatusUpdate(call_sid, 'canceled', telegram_chat_id, { status_source: 'provider' });
           break;
@@ -884,6 +950,7 @@ class EnhancedWebhookService {
     const failureStops = {
       busy: 1,
       'no-answer': 1,
+      voicemail: 2,
       failed: 0,
       canceled: 0
     };
@@ -923,12 +990,17 @@ class EnhancedWebhookService {
         const durationText = durationSeconds ? ` - Duration: ${this.formatDuration(durationSeconds)}` : '';
         return `🟢 Call ended${durationText}`;
       }
+      case 'voicemail': {
+        const durationText = durationSeconds ? ` - Duration: ${this.formatDuration(durationSeconds)}` : '';
+        return `📮 Voicemail - ${name}'s voicemail picked up${durationText}.`;
+      }
       case 'busy':
         return `🚫 Busy - ${name}'s line is occupied.`;
       case 'no-answer':
       case 'no_answer': {
         const ringText = ringDelay ? ` (rang ${ringDelay}s)` : '';
-        return `⏳ No Answer - ${name} didn't pick up${ringText}.`;
+        const voicemailText = options.voicemailDetected ? ' (voicemail reached)' : '';
+        return `⏳ No Answer - ${name} didn't pick up${ringText}${voicemailText}.`;
       }
       case 'canceled':
         return `⚠️ Canceled - Call was canceled.`;
@@ -947,6 +1019,7 @@ class EnhancedWebhookService {
       'busy': '📵',
       'no-answer': '❌',
       'canceled': '🚫',
+      'voicemail': '📮',
       'answered': '📞',
       'ringing': '🔔',
       'initiated': '📞'
@@ -1028,6 +1101,7 @@ class EnhancedWebhookService {
       answered: '📞 Picked up',
       'in-progress': '☎️ In progress',
       completed: '🟢 Completed',
+      voicemail: '📮 Voicemail',
       'no-answer': '⏳ No answer',
       busy: '🚫 Busy',
       failed: '❌ Failed',
@@ -1080,7 +1154,7 @@ class EnhancedWebhookService {
       entry.pickedUpAt = new Date();
       entry.phase = this.getConsolePhaseLabel('listening');
     }
-    if (['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status)) {
+    if (['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status)) {
       entry.phase = this.getConsolePhaseLabel('ended');
       entry.endedAt = new Date();
     }
@@ -1089,7 +1163,7 @@ class EnhancedWebhookService {
       this.addLiveEvent(callSid, statusEvent, { force: true });
     }
 
-    this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(status) });
+    this.queueLiveConsoleUpdate(callSid, { force: ['completed', 'failed', 'no-answer', 'busy', 'canceled', 'voicemail'].includes(status) });
   }
 
   async setLiveCallPhase(callSid, phaseKey, options = {}) {
@@ -1206,7 +1280,6 @@ class EnhancedWebhookService {
 
     return [
       `🎧 Live Call • ${entry.status}`,
-      `Source: ${entry.statusSource || 'provider'}`,
       `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
       entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,
       `⏱ ${elapsed} | Phase: ${phaseLine}`,
@@ -1270,6 +1343,7 @@ class EnhancedWebhookService {
       answered: `📞 ${name} picked up`,
       'in-progress': `☎️ Connected`,
       completed: `🟢 Call ended`,
+      voicemail: `📮 Voicemail detected`,
       'no-answer': `⏳ ${name} didn't pick up`,
       busy: `🚫 ${name}'s line is busy`,
       failed: `❌ Call failed`,
@@ -1321,6 +1395,8 @@ class EnhancedWebhookService {
     const history = statusInfo?.statusHistory || [];
     const mediaEvidence = this.mediaSeen.get(context?.callSid) || false;
     const persistedStatus = String(callDetails?.status || callDetails?.twilio_status || '').toLowerCase();
+    const voicemailDetected = this.isVoicemailAnswer(additionalData?.answered_by)
+      || additionalData?.voicemail_detected === true;
     const durationEvidence = Number.isFinite(Number(callDetails?.duration)) && Number(callDetails?.duration) > 0;
     const answeredEvidence = !!(
       callTiming?.answered ||
@@ -1334,6 +1410,12 @@ class EnhancedWebhookService {
 
     if (normalizedStatus === 'in-progress' && !answeredEvidence) {
       return 'ringing';
+    }
+
+    if (voicemailDetected) {
+      if (['answered', 'in-progress', 'completed', 'no-answer', 'no_answer'].includes(normalizedStatus)) {
+        return 'no-answer';
+      }
     }
 
     if ((normalizedStatus === 'no-answer' || normalizedStatus === 'no_answer') && answeredEvidence) {

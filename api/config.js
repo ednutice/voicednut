@@ -57,6 +57,11 @@ const transferNumber = readEnv('TRANSFER_NUMBER');
 const defaultSmsBusinessId = readEnv('DEFAULT_SMS_BUSINESS_ID') || null;
 const deepgramModel = readEnv('DEEPGRAM_MODEL') || 'nova-2';
 const twilioGatherFallback = String(readEnv('TWILIO_GATHER_FALLBACK') || 'true').toLowerCase() === 'true';
+const twilioMachineDetection = readEnv('TWILIO_MACHINE_DETECTION') || 'Enable';
+const twilioMachineDetectionTimeoutRaw = readEnv('TWILIO_MACHINE_DETECTION_TIMEOUT');
+const twilioMachineDetectionTimeout = Number.isFinite(Number(twilioMachineDetectionTimeoutRaw))
+  ? Number(twilioMachineDetectionTimeoutRaw)
+  : undefined;
 
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
@@ -112,6 +117,8 @@ module.exports = {
     fromNumber: ensure('FROM_NUMBER'),
     transferNumber,
     gatherFallback: twilioGatherFallback,
+    machineDetection: twilioMachineDetection,
+    machineDetectionTimeout: twilioMachineDetectionTimeout,
   },
   aws: {
     region: awsRegion,
